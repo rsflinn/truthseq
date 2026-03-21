@@ -1,0 +1,12 @@
+upstream_gene,downstream_gene,predicted_direction,cell_type_context,source
+GATA1,HBB,DOWN,,published_known_true
+GATA1,HBG1,DOWN,,published_known_true
+GATA1,HBG2,DOWN,,published_known_true
+IRF1,STAT1,DOWN,,published_known_true
+TP53,CDKN1A,DOWN,,published_known_true
+MYC,ENO1,DOWN,,published_known_true
+MYC,HBB,DOWN,,negative_control_wrong_target
+PAX6,COL1A1,DOWN,,negative_control_unrelated
+KRT5,GRIN2B,DOWN,,negative_control_unrelated
+GATA1,HBB,UP,,wrong_direction_control
+IRF1,STAT1,UP,,wrong_direction_control

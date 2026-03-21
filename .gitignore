@@ -1,0 +1,21 @@
+# Data files (too large for git, downloaded via setup.py)
+*.h5ad
+*.parquet
+gene_id_mapping.tsv
+
+# Output directories
+truthseq_report/
+truthseq_test_report/
+truthseq_v2_test_report/
+truthseq_v2_test_report_fixed/
+truthseq_v2_test_report_with_stats/
+disease_test/
+example_test/
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# OS
+.DS_Store

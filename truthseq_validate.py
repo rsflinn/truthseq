@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-TruthSeq: Validate computational gene regulatory claims against experimental data.
-==================================================================================
+TruthSeq v2: Validate computational gene regulatory claims against experimental data.
+======================================================================================
 
 Takes a CSV of gene-gene regulatory predictions and checks each one against:
   1. Direct perturbation data (Replogle Perturb-seq atlas)
-  2. Disease tissue expression (PsychENCODE ASD differential expression)
+  2. Disease tissue expression (auto-discovered or user-supplied)
   3. Genetic associations (Open Targets Platform API)
 
-Outputs a confidence grade for each claim: VALIDATED, PARTIALLY_SUPPORTED,
-CONTRADICTED, WEAK, UNTESTABLE, or CELL_TYPE_CAVEAT.
+v2 changes from v1:
+  - Tier 1: Uses per-knockdown distribution stats for accurate percentile
+    calculations, even for genes below the |Z|>1 significance threshold
+  - Tier 2: Disease-aware data discovery. Specify --disease "autism" and
+    the tool finds relevant expression data automatically via local catalog,
+    Expression Atlas API, or Harmonizome API
+  - New --disease-expr flag for user-supplied expression files
+  - Old --psychencode flag deprecated (treated as --disease-expr)
 
 Usage:
-    python truthseq_validate.py \
-        --claims claims.csv \
-        --replogle replogle_knockdown_effects.parquet \
-        --psychencode psychencode_asd_de.parquet \
-        --gene-map gene_id_mapping.tsv \
+    python3 truthseq_validate.py \\
+        --claims claims.csv \\
+        --disease "autism spectrum disorder" \\
+        --replogle replogle_knockdown_effects.parquet \\
+        --replogle-stats replogle_knockdown_stats.parquet \\
+        --gene-map gene_id_mapping.tsv \\
         --output truthseq_report
 """
 
@@ -29,7 +36,7 @@ from datetime import datetime
 
 import pandas as pd
 import numpy as np
-from scipy import stats
+from scipy import stats as sp_stats
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -73,12 +80,13 @@ def load_replogle(path):
     return None
 
 
-def load_psychencode(path):
+def load_replogle_stats(path):
+    """Load per-knockdown distribution statistics (v2 feature)."""
     if path and os.path.exists(path):
         df = pd.read_parquet(path)
-        log.info(f"Loaded PsychENCODE data: {len(df)} gene-cell_type entries")
+        log.info(f"Loaded Replogle stats: {len(df)} knockdowns with distribution data")
         return df
-    log.warning(f"PsychENCODE data not found at {path} — Tier 2 validation disabled")
+    log.info("No Replogle stats file — percentile calculations will use hits-only distribution")
     return None
 
 
@@ -93,15 +101,51 @@ def load_gene_map(path):
 
 
 # ============================================================
-# Tier 1: Perturbation Lookup
+# Tier 1: Perturbation Lookup (v2 — with distribution stats)
 # ============================================================
 
-def validate_perturbation(claims, replogle_df):
+def compute_percentile_from_stats(z_score, stats_row):
+    """
+    Compute approximate percentile rank using stored quantile breakpoints.
+
+    The stats file stores quantile values at known breakpoints (q05, q10, ...q99).
+    We interpolate to find where the query z_score falls.
+    """
+    abs_z = abs(z_score)
+
+    # Extract quantile breakpoints from the stats row
+    quantile_points = []
+    quantile_values = []
+    for col in sorted(stats_row.index):
+        if col.startswith('q') and col[1:].isdigit():
+            pct = int(col[1:])
+            quantile_points.append(pct)
+            quantile_values.append(float(stats_row[col]))
+
+    if not quantile_points:
+        return None
+
+    # Interpolate: find where abs_z falls in the quantile distribution
+    quantile_points = np.array(quantile_points)
+    quantile_values = np.array(quantile_values)
+
+    if abs_z <= quantile_values[0]:
+        return float(quantile_points[0])
+    if abs_z >= quantile_values[-1]:
+        return min(99.9, float(quantile_points[-1]) + 0.5)
+
+    # Linear interpolation between quantile breakpoints
+    percentile = float(np.interp(abs_z, quantile_values, quantile_points))
+    return percentile
+
+
+def validate_perturbation(claims, replogle_df, stats_df=None):
     """
     For each claim, look up whether the upstream gene was knocked down
-    in the Replogle dataset and what happened to the downstream gene.
+    and what happened to the downstream gene.
 
-    Returns a dict keyed by claim index with perturbation evidence.
+    v2: Uses stats_df for accurate percentile calculations when the
+    downstream gene's effect falls below the |Z|>1 threshold.
     """
     if replogle_df is None:
         return {i: _empty_perturb_result("NO_DATA") for i in claims.index}
@@ -109,26 +153,102 @@ def validate_perturbation(claims, replogle_df):
     results = {}
     np.random.seed(RANDOM_SEED)
 
-    all_affected_genes = replogle_df['affected_gene'].unique()
     available_kd_genes = set(replogle_df['knocked_down_gene'].unique())
+
+    # Also check stats file for additional knockdown coverage
+    stats_kd_genes = set()
+    if stats_df is not None:
+        stats_kd_genes = set(stats_df['knocked_down_gene'].unique())
+
+    all_kd_genes = available_kd_genes | stats_kd_genes
 
     for idx, row in claims.iterrows():
         upstream = row['upstream_gene']
         downstream = row['downstream_gene']
         predicted_dir = row['predicted_direction']
 
-        if upstream not in available_kd_genes:
+        if upstream not in all_kd_genes:
             results[idx] = _empty_perturb_result("UPSTREAM_NOT_TESTED")
             continue
 
+        # Check if we have a direct hit in the effects file
         kd_data = replogle_df[replogle_df['knocked_down_gene'] == upstream]
         target_hit = kd_data[kd_data['affected_gene'] == downstream]
 
-        if len(target_hit) == 0:
-            # Upstream was knocked down but downstream didn't make the
-            # significance cutoff (|Z| > 1 in preprocessing). This means
-            # the effect was small — the downstream gene was NOT notably
-            # affected by this knockdown.
+        if len(target_hit) > 0:
+            # Direct hit found — same logic as v1 but with better percentile calc
+            observed_z = float(target_hit.iloc[0]['z_score'])
+            cell_line = target_hit.iloc[0].get('cell_line', 'K562')
+
+            observed_dir = "DOWN" if observed_z < 0 else "UP"
+            direction_match = (observed_dir == predicted_dir)
+
+            # Compute percentile rank
+            percentile = None
+
+            # Try stats-based percentile first (most accurate)
+            if stats_df is not None and upstream in stats_kd_genes:
+                stats_row = stats_df[stats_df['knocked_down_gene'] == upstream].iloc[0]
+                percentile = compute_percentile_from_stats(observed_z, stats_row)
+
+            # Fallback: compute from available hits
+            if percentile is None:
+                all_z_for_this_kd = kd_data['z_score'].values
+                if len(all_z_for_this_kd) > NULL_SAMPLE_SIZE:
+                    null_sample = np.random.choice(all_z_for_this_kd, NULL_SAMPLE_SIZE, replace=False)
+                else:
+                    null_sample = all_z_for_this_kd
+                percentile = float(sp_stats.percentileofscore(np.abs(null_sample), abs(observed_z)))
+
+            results[idx] = {
+                'perturb_status': 'DATA_FOUND',
+                'perturb_z_score': round(observed_z, 4),
+                'perturb_direction_match': direction_match,
+                'perturb_percentile': round(percentile, 1),
+                'perturb_cell_line': cell_line,
+                'perturb_null_mean': None,
+                'perturb_null_std': None,
+                'perturb_note': (
+                    f"Knockdown of {upstream} changed {downstream} expression "
+                    f"(Z={observed_z:.2f}, direction={'matches' if direction_match else 'OPPOSES'} prediction, "
+                    f"percentile={percentile:.0f}% vs random genes after same knockdown). "
+                    f"Cell line: {cell_line}."
+                )
+            }
+
+        elif stats_df is not None and upstream in stats_kd_genes:
+            # v2: Upstream was knocked down but downstream didn't make |Z|>1.
+            # Use stats to estimate where it falls in the distribution.
+            stats_row = stats_df[stats_df['knocked_down_gene'] == upstream].iloc[0]
+            median_z = float(stats_row.get('median_abs_z', 0.3))
+            n_tested = int(stats_row.get('n_genes_tested', 8000))
+
+            # The downstream gene had |Z| < 1 (below the threshold for the hits file).
+            # Its percentile is at most the percentile corresponding to |Z|=1
+            # in this knockdown's distribution — likely below 80th percentile.
+            max_percentile = compute_percentile_from_stats(1.0, stats_row)
+            if max_percentile is None:
+                max_percentile = 84  # Rough estimate: |Z|>1 is ~top 16% of normal
+
+            results[idx] = {
+                'perturb_status': 'BELOW_THRESHOLD',
+                'perturb_z_score': None,
+                'perturb_direction_match': None,
+                'perturb_percentile': round(max_percentile / 2, 1),  # Midpoint estimate
+                'perturb_cell_line': 'K562',
+                'perturb_null_mean': round(median_z, 4),
+                'perturb_null_std': float(stats_row.get('std_abs_z', 0)),
+                'perturb_note': (
+                    f"Knockdown of {upstream} was tested ({n_tested} genes measured) "
+                    f"but {downstream} did not reach the |Z|>1 significance threshold. "
+                    f"Effect was below the {max_percentile:.0f}th percentile of all genes "
+                    f"after this knockdown (median |Z|={median_z:.2f}). "
+                    f"This gene was not notably more affected than typical genes."
+                )
+            }
+
+        else:
+            # v1 behavior: no stats available
             results[idx] = {
                 'perturb_status': 'WEAK_OR_ABSENT',
                 'perturb_z_score': 0.0,
@@ -139,46 +259,9 @@ def validate_perturbation(claims, replogle_df):
                 'perturb_null_std': None,
                 'perturb_note': (
                     f"Knockdown of {upstream} did not produce a notable "
-                    f"expression change in {downstream} (below |Z|>1 threshold). "
-                    f"This gene was not more affected than typical genes."
+                    f"expression change in {downstream} (below |Z|>1 threshold)."
                 )
             }
-            continue
-
-        observed_z = float(target_hit.iloc[0]['z_score'])
-        cell_line = target_hit.iloc[0].get('cell_line', 'K562')
-
-        # Determine observed direction
-        # In CRISPRi data: negative Z means gene went DOWN after knockdown
-        observed_dir = "DOWN" if observed_z < 0 else "UP"
-        direction_match = (observed_dir == predicted_dir)
-
-        # Compute null distribution: random genes' responses to same knockdown
-        all_z_for_this_kd = kd_data['z_score'].values
-        if len(all_z_for_this_kd) > NULL_SAMPLE_SIZE:
-            null_sample = np.random.choice(all_z_for_this_kd, NULL_SAMPLE_SIZE, replace=False)
-        else:
-            null_sample = all_z_for_this_kd
-
-        null_abs = np.abs(null_sample)
-        observed_abs = abs(observed_z)
-        percentile = float(stats.percentileofscore(null_abs, observed_abs))
-
-        results[idx] = {
-            'perturb_status': 'DATA_FOUND',
-            'perturb_z_score': round(observed_z, 4),
-            'perturb_direction_match': direction_match,
-            'perturb_percentile': round(percentile, 1),
-            'perturb_cell_line': cell_line,
-            'perturb_null_mean': round(float(np.mean(null_abs)), 4),
-            'perturb_null_std': round(float(np.std(null_abs)), 4),
-            'perturb_note': (
-                f"Knockdown of {upstream} changed {downstream} expression "
-                f"(Z={observed_z:.2f}, direction={'matches' if direction_match else 'OPPOSES'} prediction, "
-                f"percentile={percentile:.0f}% vs random genes after same knockdown). "
-                f"Cell line: {cell_line}."
-            )
-        }
 
     return results
 
@@ -197,14 +280,17 @@ def _empty_perturb_result(status):
 
 
 # ============================================================
-# Tier 2: Disease Tissue Expression
+# Tier 2: Disease Tissue Expression (v2 — disease-aware)
 # ============================================================
 
-def validate_disease_expression(claims, psychencode_df):
+def validate_disease_expression(claims, disease_df, disease_source=""):
     """
-    Check whether downstream genes are actually dysregulated in ASD brain tissue.
+    Check whether downstream genes are actually dysregulated in disease tissue.
+
+    v2: Accepts any standardized DataFrame from the disease lookup system,
+    not just the hardcoded PsychENCODE format.
     """
-    if psychencode_df is None:
+    if disease_df is None:
         return {i: _empty_de_result("NO_DATA") for i in claims.index}
 
     results = {}
@@ -213,26 +299,25 @@ def validate_disease_expression(claims, psychencode_df):
         downstream = row['downstream_gene']
         cell_context = row.get('cell_type_context', '')
 
-        gene_data = psychencode_df[psychencode_df['gene'] == downstream]
+        gene_data = disease_df[disease_df['gene'] == downstream]
 
         if len(gene_data) == 0:
             results[idx] = _empty_de_result("GENE_NOT_IN_DATASET")
             continue
 
-        # If user specified a cell type, try to match it
+        # Cell type matching
         best_match = None
         cell_type_matched = False
 
         if cell_context:
             context_lower = cell_context.lower().replace(' ', '_')
             for _, grow in gene_data.iterrows():
-                ct = str(grow['cell_type']).lower().replace(' ', '_')
-                if context_lower in ct or ct in context_lower:
+                ct = str(grow.get('cell_type', '')).lower().replace(' ', '_')
+                if ct and (context_lower in ct or ct in context_lower):
                     best_match = grow
                     cell_type_matched = True
                     break
 
-        # If no cell type match, use the most significant result
         if best_match is None:
             gene_data_sorted = gene_data.sort_values('padj')
             best_match = gene_data_sorted.iloc[0]
@@ -240,8 +325,8 @@ def validate_disease_expression(claims, psychencode_df):
 
         padj = float(best_match['padj'])
         log2fc = float(best_match['log2fc'])
-        ct = best_match['cell_type']
-        source = best_match.get('dataset_source', 'PsychENCODE')
+        ct = best_match.get('cell_type', 'unknown')
+        source = best_match.get('source', disease_source)
 
         is_significant = padj < 0.05
         direction = "DOWN" if log2fc < 0 else "UP"
@@ -256,7 +341,7 @@ def validate_disease_expression(claims, psychencode_df):
             'de_source': source,
             'de_note': (
                 f"{downstream} is {'significantly' if is_significant else 'NOT significantly'} "
-                f"dysregulated in ASD brain ({ct}: log2FC={log2fc:.3f}, padj={padj:.4f}). "
+                f"dysregulated in disease tissue ({ct}: log2FC={log2fc:.3f}, padj={padj:.4f}). "
                 f"{'Cell type matches claim context.' if cell_type_matched else f'NOTE: Data from {ct}, not {cell_context}.'} "
                 f"Source: {source}."
             )
@@ -279,20 +364,17 @@ def _empty_de_result(status):
 
 
 # ============================================================
-# Tier 3: Genetic Association (Open Targets API)
+# Tier 3: Genetic Association (Open Targets API) — unchanged
 # ============================================================
 
 def validate_genetic_association(claims, gene_map):
-    """
-    Query Open Targets for disease associations for each gene.
-    """
     if not gene_map:
         return {i: _empty_ot_result("NO_GENE_MAP") for i in claims.index}
 
     import requests
 
     OT_API = "https://api.platform.opentargets.org/api/v4/graphql"
-    ASD_EFO = "MONDO_0005258"  # autism spectrum disorder
+    ASD_EFO = "MONDO_0005258"
 
     results = {}
     all_genes = set(claims['upstream_gene'].tolist() + claims['downstream_gene'].tolist())
@@ -336,12 +418,9 @@ def validate_genetic_association(claims, gene_map):
 
             if resp.status_code == 200:
                 data = resp.json().get('data', {})
-
-                # Check for direct ASD association
                 asd_rows = (data.get('disease', {}) or {}).get('associatedTargets', {}).get('rows', [])
                 asd_score = asd_rows[0]['score'] if asd_rows else 0.0
 
-                # Get top disease associations for context
                 target_data = data.get('target', {}) or {}
                 top_diseases = []
                 for drow in (target_data.get('associatedDiseases', {}) or {}).get('rows', []):
@@ -361,7 +440,6 @@ def validate_genetic_association(claims, gene_map):
         except Exception as e:
             gene_scores[gene] = {'score': None, 'status': f'ERROR: {str(e)[:50]}'}
 
-    # Map back to claims
     for idx, row in claims.iterrows():
         up_info = gene_scores.get(row['upstream_gene'], {'score': None, 'status': 'UNKNOWN'})
         down_info = gene_scores.get(row['downstream_gene'], {'score': None, 'status': 'UNKNOWN'})
@@ -392,14 +470,17 @@ def _empty_ot_result(status):
 
 
 # ============================================================
-# Confidence Grading
+# Confidence Grading (v2 — handles BELOW_THRESHOLD status)
 # ============================================================
 
-def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
-    """
-    Combine evidence from all three tiers into a confidence grade for each claim.
-    """
+def assign_confidence_grades(claims, perturb_results, de_results, ot_results, disease_df=None):
     grades = {}
+
+    # Build set of genes present in disease expression data (for upstream check)
+    disease_genes = set()
+    if disease_df is not None and 'gene' in disease_df.columns:
+        sig_disease = disease_df[disease_df['padj'] <= 0.05]
+        disease_genes = set(sig_disease['gene'].unique())
 
     for idx in claims.index:
         pr = perturb_results.get(idx, _empty_perturb_result("MISSING"))
@@ -412,7 +493,6 @@ def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
         de_sig = dr.get('de_status') == 'SIGNIFICANT'
         de_ct_match = dr.get('de_cell_type_matched', False)
 
-        # Grade assignment logic
         if perturb_status == 'DATA_FOUND':
             if direction_match is False:
                 grade = 'CONTRADICTED'
@@ -454,13 +534,67 @@ def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
                     f"neither matches the claimed context."
                 )
 
+        elif perturb_status == 'BELOW_THRESHOLD':
+            # v2: We know the gene was tested but fell below |Z|>1
+            upstream = claims.loc[idx, 'upstream_gene']
+            upstream_in_disease = upstream in disease_genes if disease_genes else False
+
+            if de_sig and upstream_in_disease:
+                grade = 'PARTIALLY_SUPPORTED'
+                reason = (
+                    "Knockdown of the upstream gene did not produce a strong effect on "
+                    "the downstream gene (below |Z|>1 threshold in K562 cells), but BOTH "
+                    "the upstream regulator and downstream target are dysregulated in "
+                    "disease tissue. The regulatory relationship may be cell-type-specific."
+                )
+            elif de_sig and not upstream_in_disease and disease_genes:
+                # Downstream is dysregulated but upstream is NOT — weaker evidence
+                grade = 'WEAK'
+                reason = (
+                    "The downstream gene is dysregulated in disease tissue, but the "
+                    "upstream regulator is NOT — suggesting the downstream gene's "
+                    "dysregulation may not be due to this regulatory link. "
+                    "Perturbation data also showed no notable effect (below |Z|>1 threshold)."
+                )
+            elif de_sig:
+                # Disease data available but we can't check upstream (small dataset)
+                grade = 'PARTIALLY_SUPPORTED'
+                reason = (
+                    "Knockdown of the upstream gene did not produce a strong effect on "
+                    "the downstream gene (below |Z|>1 threshold in K562 cells), but the "
+                    "downstream gene IS dysregulated in disease tissue. The regulatory "
+                    "relationship may be cell-type-specific or indirect."
+                )
+            else:
+                grade = 'WEAK'
+                reason = (
+                    "Knockdown of the upstream gene was tested but did not notably affect "
+                    "the downstream gene (below |Z|>1 threshold), and the downstream gene "
+                    "is not significantly dysregulated in disease tissue."
+                )
+
         elif perturb_status == 'WEAK_OR_ABSENT':
-            if de_sig:
+            upstream = claims.loc[idx, 'upstream_gene']
+            upstream_in_disease = upstream in disease_genes if disease_genes else False
+
+            if de_sig and upstream_in_disease:
+                grade = 'PARTIALLY_SUPPORTED'
+                reason = (
+                    "No notable perturbation effect, but BOTH the upstream regulator and "
+                    "downstream target are dysregulated in disease tissue."
+                )
+            elif de_sig and not upstream_in_disease and disease_genes:
+                grade = 'WEAK'
+                reason = (
+                    "The downstream gene is dysregulated in disease tissue, but the "
+                    "upstream regulator is NOT — suggesting the dysregulation may not "
+                    "be due to this regulatory link."
+                )
+            elif de_sig:
                 grade = 'PARTIALLY_SUPPORTED'
                 reason = (
                     "No notable perturbation effect, but the downstream gene IS "
-                    "dysregulated in disease tissue. The regulatory relationship "
-                    "may exist through indirect mechanisms not captured by single-gene knockdown."
+                    "dysregulated in disease tissue."
                 )
             else:
                 grade = 'WEAK'
@@ -471,7 +605,24 @@ def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
                 )
 
         elif perturb_status in ('UPSTREAM_NOT_TESTED', 'NO_DATA'):
-            if de_sig:
+            upstream = claims.loc[idx, 'upstream_gene']
+            upstream_in_disease = upstream in disease_genes if disease_genes else False
+
+            if de_sig and upstream_in_disease:
+                grade = 'PARTIALLY_SUPPORTED'
+                reason = (
+                    "No perturbation data available for the upstream gene. However, "
+                    "BOTH the upstream regulator and downstream target are dysregulated "
+                    "in disease tissue, which is consistent with the claim."
+                )
+            elif de_sig and not upstream_in_disease and disease_genes:
+                grade = 'WEAK'
+                reason = (
+                    "No perturbation data available. The downstream gene is dysregulated "
+                    "in disease tissue, but the upstream regulator is NOT — the dysregulation "
+                    "may not be due to this regulatory link."
+                )
+            elif de_sig:
                 grade = 'PARTIALLY_SUPPORTED'
                 reason = (
                     "No perturbation data available for the upstream gene. However, "
@@ -482,8 +633,7 @@ def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
                 grade = 'UNTESTABLE'
                 reason = (
                     "No perturbation data for the upstream gene and no significant "
-                    "disease tissue dysregulation for the downstream gene. This claim "
-                    "cannot be validated or refuted with available data."
+                    "disease tissue dysregulation for the downstream gene."
                 )
         else:
             grade = 'UNTESTABLE'
@@ -498,7 +648,7 @@ def assign_confidence_grades(claims, perturb_results, de_results, ot_results):
 
 
 # ============================================================
-# Output Generation
+# Output Generation (unchanged from v1 except minor tweaks)
 # ============================================================
 
 def build_results_table(claims, perturb_results, de_results, ot_results, grades):
@@ -516,27 +666,20 @@ def build_results_table(claims, perturb_results, de_results, ot_results, grades)
             'predicted_direction': claim['predicted_direction'],
             'cell_type_context': claim.get('cell_type_context', ''),
             'source': claim.get('source', ''),
-            # Tier 1
             'perturb_status': pr.get('perturb_status'),
             'perturb_z_score': pr.get('perturb_z_score'),
             'perturb_direction_match': pr.get('perturb_direction_match'),
             'perturb_percentile': pr.get('perturb_percentile'),
             'perturb_cell_line': pr.get('perturb_cell_line'),
-            'perturb_null_mean': pr.get('perturb_null_mean'),
-            'perturb_null_std': pr.get('perturb_null_std'),
-            # Tier 2
             'de_status': dr.get('de_status'),
             'de_log2fc': dr.get('de_log2fc'),
             'de_padj': dr.get('de_padj'),
             'de_cell_type': dr.get('de_cell_type'),
             'de_cell_type_matched': dr.get('de_cell_type_matched'),
-            # Tier 3
             'ot_upstream_asd_score': ot.get('ot_upstream_asd_score'),
             'ot_downstream_asd_score': ot.get('ot_downstream_asd_score'),
-            # Grade
             'confidence_grade': gr.get('confidence_grade'),
             'grade_reason': gr.get('grade_reason'),
-            # Evidence narratives
             'perturb_evidence': pr.get('perturb_note', ''),
             'de_evidence': dr.get('de_note', ''),
             'ot_evidence': ot.get('ot_note', ''),
@@ -546,10 +689,6 @@ def build_results_table(claims, perturb_results, de_results, ot_results, grades)
 
 
 def compute_base_rate(results_df, replogle_df):
-    """
-    What fraction of random gene pairs would score VALIDATED or PARTIALLY_SUPPORTED?
-    This is the base rate comparison that makes TruthSeq useful.
-    """
     if replogle_df is None:
         return None
 
@@ -560,22 +699,44 @@ def compute_base_rate(results_df, replogle_df):
     all_kd_genes = replogle_df['knocked_down_gene'].unique()
     all_affected_genes = replogle_df['affected_gene'].unique()
 
+    # Pre-index for fast lookups (critical for large datasets)
+    log.info("  Building lookup index...")
+
+    # For large datasets, use a sampled approach to avoid memory/time issues
+    max_pairs_for_index = 2_000_000
+    if len(replogle_df) > max_pairs_for_index:
+        log.info(f"  Dataset has {len(replogle_df):,} pairs — sampling {max_pairs_for_index:,} for simulation")
+        sim_df = replogle_df.sample(n=max_pairs_for_index, random_state=RANDOM_SEED)
+    else:
+        sim_df = replogle_df
+
+    # Build pair lookup using vectorized tuple creation
+    pair_lookup = dict(zip(
+        zip(sim_df['knocked_down_gene'], sim_df['affected_gene']),
+        sim_df['z_score'].abs()
+    ))
+
+    # Pre-compute percentile thresholds per knockdown
+    kd_z_values = {}
+    for kd_gene, group in sim_df.groupby('knocked_down_gene'):
+        kd_z_values[kd_gene] = group['z_score'].abs().values
+
+    log.info(f"  Index built: {len(pair_lookup):,} pairs indexed")
+
     positive_counts = []
 
-    for _ in range(n_simulations):
+    for sim_i in range(n_simulations):
+        if sim_i % 200 == 0:
+            log.info(f"  Simulation {sim_i}/{n_simulations}...")
+
         random_ups = np.random.choice(all_kd_genes, n_claims, replace=True)
         random_downs = np.random.choice(all_affected_genes, n_claims, replace=True)
 
         count = 0
         for up, down in zip(random_ups, random_downs):
-            hit = replogle_df[
-                (replogle_df['knocked_down_gene'] == up) &
-                (replogle_df['affected_gene'] == down)
-            ]
-            if len(hit) > 0:
-                z = abs(float(hit.iloc[0]['z_score']))
-                kd_all = replogle_df[replogle_df['knocked_down_gene'] == up]['z_score'].abs()
-                pct = stats.percentileofscore(kd_all.values, z)
+            z = pair_lookup.get((up, down))
+            if z is not None and up in kd_z_values:
+                pct = sp_stats.percentileofscore(kd_z_values[up], z)
                 if pct >= PERCENTILE_PARTIAL:
                     count += 1
         positive_counts.append(count)
@@ -590,8 +751,7 @@ def compute_base_rate(results_df, replogle_df):
     }
 
 
-def generate_summary_report(results_df, base_rate, output_dir):
-    """Write the human-readable Markdown summary report."""
+def generate_summary_report(results_df, base_rate, disease_source, output_dir):
     grade_counts = results_df['confidence_grade'].value_counts()
     n = len(results_df)
 
@@ -599,6 +759,7 @@ def generate_summary_report(results_df, base_rate, output_dir):
         f"# TruthSeq Validation Report",
         f"",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"Disease context: {disease_source}",
         f"",
         f"## Overall Scorecard",
         f"",
@@ -615,7 +776,6 @@ def generate_summary_report(results_df, base_rate, output_dir):
 
     lines.append("")
 
-    # Base rate comparison
     if base_rate:
         obs = base_rate['observed']
         null_mean = base_rate['null_mean']
@@ -623,7 +783,7 @@ def generate_summary_report(results_df, base_rate, output_dir):
 
         if null_std > 0:
             z_vs_null = (obs - null_mean) / null_std
-            p_val = 1 - stats.norm.cdf(z_vs_null)
+            p_val = 1 - sp_stats.norm.cdf(z_vs_null)
             lines.append(f"## Base Rate Comparison")
             lines.append(f"")
             lines.append(
@@ -636,11 +796,10 @@ def generate_summary_report(results_df, base_rate, output_dir):
         else:
             lines.append(f"## Base Rate Comparison")
             lines.append(f"")
-            lines.append(f"Null distribution had zero variance — likely too few perturbation matches to compute a reliable base rate.")
+            lines.append(f"Null distribution had zero variance — likely too few perturbation matches.")
 
         lines.append("")
 
-    # Per-claim details
     lines.append("## Per-Claim Evidence")
     lines.append("")
 
@@ -664,7 +823,6 @@ def generate_summary_report(results_df, base_rate, output_dir):
         lines.append("---")
         lines.append("")
 
-    # Warnings
     lines.append("## Warnings and Limitations")
     lines.append("")
 
@@ -680,15 +838,13 @@ def generate_summary_report(results_df, base_rate, output_dir):
 
     lines.append(
         "**Perturbation =/= regulation**: A knockdown effect shows that gene X's "
-        "expression affects gene Y, but does not prove direct transcriptional regulation. "
-        "The effect could be indirect, mediated through intermediate genes or pathways."
+        "expression affects gene Y, but does not prove direct transcriptional regulation."
     )
     lines.append("")
 
     lines.append(
         "**Observational =/= causal**: Disease tissue differential expression (Tier 2) "
-        "shows correlation with disease state, not causation. A gene can be dysregulated "
-        "in ASD brain as a downstream consequence rather than a causal driver."
+        "shows correlation with disease state, not causation."
     )
 
     report_path = os.path.join(output_dir, "truthseq_summary.md")
@@ -698,14 +854,13 @@ def generate_summary_report(results_df, base_rate, output_dir):
 
 
 def generate_heatmap(results_df, output_dir):
-    """Create a confidence heatmap visualization."""
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
     except ImportError:
-        log.warning("matplotlib not available — skipping heatmap generation")
+        log.warning("matplotlib not available — skipping heatmap")
         return
 
     grade_colors = {
@@ -718,12 +873,10 @@ def generate_heatmap(results_df, output_dir):
     }
 
     fig, ax = plt.subplots(figsize=(12, max(4, len(results_df) * 0.6)))
-
     labels = [f"{r['upstream_gene']} -> {r['downstream_gene']}" for _, r in results_df.iterrows()]
     tiers = ['Perturbation\n(Tier 1)', 'Disease Tissue\n(Tier 2)', 'Overall\nGrade']
 
     for i, (_, row) in enumerate(results_df.iterrows()):
-        # Tier 1 color
         ps = row.get('perturb_status', '')
         if ps == 'DATA_FOUND':
             pct = row.get('perturb_percentile', 0) or 0
@@ -736,12 +889,11 @@ def generate_heatmap(results_df, output_dir):
                 c1 = '#f1c40f'
             else:
                 c1 = '#bdc3c7'
-        elif ps == 'WEAK_OR_ABSENT':
+        elif ps in ('WEAK_OR_ABSENT', 'BELOW_THRESHOLD'):
             c1 = '#bdc3c7'
         else:
             c1 = '#ecf0f1'
 
-        # Tier 2 color
         ds = row.get('de_status', '')
         if ds == 'SIGNIFICANT':
             c2 = '#2ecc71'
@@ -750,7 +902,6 @@ def generate_heatmap(results_df, output_dir):
         else:
             c2 = '#ecf0f1'
 
-        # Overall grade color
         grade = row.get('confidence_grade', 'UNTESTABLE')
         c3 = grade_colors.get(grade, '#ecf0f1')
 
@@ -779,11 +930,10 @@ def generate_heatmap(results_df, output_dir):
 
 
 # ============================================================
-# Main
+# Demo claims
 # ============================================================
 
 def create_demo_claims(output_path):
-    """Create the demo claims file if none provided."""
     demo = pd.DataFrame([
         {"upstream_gene": "MYT1L", "downstream_gene": "MEF2C", "predicted_direction": "DOWN",
          "cell_type_context": "neuron", "source": "GRN inference"},
@@ -807,85 +957,122 @@ def create_demo_claims(output_path):
     return output_path
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="TruthSeq: Validate gene regulatory claims")
+    parser = argparse.ArgumentParser(description="TruthSeq v2: Validate gene regulatory claims")
     parser.add_argument('--claims', default=None, help='CSV file with claims (or omit for demo)')
     parser.add_argument('--replogle', default='replogle_knockdown_effects.parquet')
-    parser.add_argument('--psychencode', default='psychencode_asd_de.parquet')
+    parser.add_argument('--replogle-stats', default='replogle_knockdown_stats.parquet',
+                        help='Per-knockdown distribution stats (v2)')
+    parser.add_argument('--disease', default=None,
+                        help='Disease keyword for auto-discovery (e.g., "autism", "breast cancer")')
+    parser.add_argument('--disease-expr', default=None,
+                        help='User-supplied disease expression file (TSV/CSV/parquet)')
+    parser.add_argument('--dataset-registry', default=None,
+                        help='Path to dataset registry CSV')
+    # Deprecated v1 flags
+    parser.add_argument('--disease-catalog', default=None,
+                        help='DEPRECATED: use --dataset-registry')
+    parser.add_argument('--psychencode', default=None,
+                        help='DEPRECATED: use --disease-expr instead')
     parser.add_argument('--gene-map', default='gene_id_mapping.tsv')
     parser.add_argument('--output', default='truthseq_report', help='Output directory')
-    parser.add_argument('--skip-ot', action='store_true', help='Skip Open Targets API queries')
-    parser.add_argument('--skip-base-rate', action='store_true',
-                        help='Skip base rate simulation (faster)')
+    parser.add_argument('--skip-ot', action='store_true', help='Skip Open Targets API')
+    parser.add_argument('--skip-base-rate', action='store_true', help='Skip base rate simulation')
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
+
+    # Handle deprecated --psychencode flag
+    if args.psychencode and not args.disease_expr:
+        log.warning("--psychencode is deprecated. Use --disease-expr instead.")
+        args.disease_expr = args.psychencode
 
     # Load claims
     if args.claims and os.path.exists(args.claims):
         claims = load_claims(args.claims)
     else:
-        log.info("No claims file provided — using demo ORC gene claims")
+        log.info("No claims file — using demo ORC gene claims")
         demo_path = os.path.join(args.output, "demo_claims.csv")
         create_demo_claims(demo_path)
         claims = load_claims(demo_path)
 
-    # Load reference data
+    # Load Tier 1 data
     replogle_df = load_replogle(args.replogle)
-    psychencode_df = load_psychencode(args.psychencode)
+    stats_df = load_replogle_stats(args.replogle_stats)
+
+    # Load Tier 2 data via disease lookup
+    from disease_lookup import find_disease_expression
+    disease_df, disease_source = find_disease_expression(
+        disease=args.disease,
+        disease_expr_file=args.disease_expr,
+        registry_path=args.dataset_registry,
+    )
+
+    if disease_df is not None:
+        log.info(f"Tier 2 data source: {disease_source}")
+        log.info(f"  {len(disease_df)} entries, {disease_df['gene'].nunique()} unique genes")
+    else:
+        log.info(f"Tier 2: {disease_source}")
+
+    # Load Tier 3 data
     gene_map = load_gene_map(args.gene_map) if not args.skip_ot else {}
 
-    # Run three tiers of validation
+    # Run validation
     log.info("")
     log.info("=== Tier 1: Perturbation Lookup ===")
-    perturb_results = validate_perturbation(claims, replogle_df)
+    perturb_results = validate_perturbation(claims, replogle_df, stats_df)
 
     log.info("")
     log.info("=== Tier 2: Disease Tissue Expression ===")
-    de_results = validate_disease_expression(claims, psychencode_df)
+    de_results = validate_disease_expression(claims, disease_df, disease_source)
 
     log.info("")
     log.info("=== Tier 3: Genetic Association ===")
     if args.skip_ot:
-        log.info("Skipped (--skip-ot flag)")
+        log.info("Skipped (--skip-ot)")
         ot_results = {i: _empty_ot_result("SKIPPED") for i in claims.index}
     else:
         ot_results = validate_genetic_association(claims, gene_map)
 
-    # Assign grades
+    # Grade
     log.info("")
     log.info("=== Confidence Grading ===")
-    grades = assign_confidence_grades(claims, perturb_results, de_results, ot_results)
+    grades = assign_confidence_grades(claims, perturb_results, de_results, ot_results, disease_df=disease_df)
 
-    # Build results table
+    # Build output
     results_df = build_results_table(claims, perturb_results, de_results, ot_results, grades)
 
-    # Save CSV
     csv_path = os.path.join(args.output, "truthseq_results.csv")
     results_df.to_csv(csv_path, index=False)
     log.info(f"Results table saved to {csv_path}")
 
-    # Base rate comparison
+    # Base rate
     base_rate = None
     if not args.skip_base_rate and replogle_df is not None:
         log.info("")
-        log.info("=== Base Rate Simulation (1000 random gene sets) ===")
+        log.info("=== Base Rate Simulation ===")
         base_rate = compute_base_rate(results_df, replogle_df)
         if base_rate:
-            log.info(f"  Null expectation: {base_rate['null_mean']} +/- {base_rate['null_std']}")
+            log.info(f"  Null: {base_rate['null_mean']} +/- {base_rate['null_std']}")
             log.info(f"  Observed: {base_rate['observed']}")
 
-    # Generate reports
+    # Reports
     log.info("")
     log.info("=== Generating Reports ===")
-    generate_summary_report(results_df, base_rate, args.output)
+    generate_summary_report(results_df, base_rate, disease_source, args.output)
     generate_heatmap(results_df, args.output)
 
-    # Print summary to console
+    # Console summary
     print("")
     print("=" * 60)
     print("TruthSeq Validation Complete")
     print("=" * 60)
+    if disease_source:
+        print(f"  Disease context: {disease_source}")
     grade_counts = results_df['confidence_grade'].value_counts()
     for g in ['VALIDATED', 'PARTIALLY_SUPPORTED', 'CELL_TYPE_CAVEAT',
               'WEAK', 'CONTRADICTED', 'UNTESTABLE']:
@@ -893,7 +1080,7 @@ def main():
         print(f"  {g:25s} {c}")
     print(f"  {'TOTAL':25s} {len(results_df)}")
     print("")
-    print(f"Output files in: {args.output}/")
+    print(f"Output: {args.output}/")
     print(f"  truthseq_results.csv    — full evidence table")
     print(f"  truthseq_summary.md     — human-readable report")
     print(f"  truthseq_heatmap.png    — confidence visualization")

@@ -1,159 +1,128 @@
 # TruthSeq
 
-Validate computational gene regulatory claims against real perturbation experiments.
+Validate computational gene regulatory claims against real experimental data.
+
+You predicted Gene X regulates Gene Y? TruthSeq checks what actually happened when Gene X was knocked down in human cells. You can also layer on disease tissue expression and genetic association data to build a multi-evidence confidence grade for each claim.
 
 ## What it does
 
-TruthSeq takes a table of gene-gene regulatory predictions — the kind produced by network inference, pathway enrichment, co-expression analysis or any other computational method — and checks each one against experimental data from public databases. It tells you which claims survive contact with actual biology and which don't.
+TruthSeq takes a CSV of gene-gene regulatory predictions and validates each one against up to three independent data sources:
 
-For each claim, TruthSeq reports a confidence grade (VALIDATED, PARTIALLY SUPPORTED, CONTRADICTED, WEAK, or UNTESTABLE) with full evidence and base-rate context showing how the claimed gene pair compares to random pairs from the same dataset.
+**Tier 1 — Perturbation data (core).** The Replogle genome-wide Perturb-seq atlas: ~11,000 single-gene CRISPR knockdowns in human K562 cells, measuring expression changes across ~8,000 genes. If your upstream gene was knocked down, TruthSeq reports what happened to your downstream gene — the Z-score, direction, and percentile rank versus all other genes affected by the same knockdown.
 
-## Why it exists
+**Tier 2 — Disease tissue expression (optional).** Supply a differential expression dataset from disease tissue, or let TruthSeq search for one. It checks whether your downstream gene is actually dysregulated in that disease context. This adds biological relevance but can't prove causation.
 
-Computational genomics tools make it easy to generate thousands of gene regulatory predictions that look statistically significant but live entirely in annotation space. Most are never checked against what actually happens when you knock a gene down in a real cell.
+**Tier 3 — Genetic association (optional).** Queries Open Targets to check whether your genes have known genetic associations with the disease of interest.
 
-TruthSeq was built during a citizen-science project investigating autism genetics, where over 90 computational analyses produced a causal hypothesis supported by multiple standard network metrics. When tested against actual perturbation data, the claim did not survive (p = 0.31). TruthSeq is designed to catch that kind of failure early.
-
-## Validation tiers
-
-**Tier 1 — Direct perturbation (gold standard).** The Replogle et al. (2022) Perturb-seq atlas provides genome-wide CRISPRi knockdown data for ~9,867 genes in K562 cells. For each claim, TruthSeq looks up whether the upstream gene was knocked down and what happened to the downstream gene's expression. It computes a null distribution from 500 random genes' responses to the same knockdown, so the output answers not just "did the downstream gene change?" but "did it change more than a random gene would?" — the base-rate question most analyses skip.
-
-**Tier 2 — Disease tissue expression (observational).** PsychENCODE single-nucleus RNA-seq from ASD vs. control postmortem brain provides cell-type-specific differential expression. TruthSeq checks whether each downstream gene is actually dysregulated in the relevant disease context and flags cell-type mismatches.
-
-**Tier 3 — Genetic association (population-level).** The Open Targets Platform API provides gene-disease association scores for population-level context.
-
-## Confidence grades
-
-| Grade | Meaning |
-|---|---|
-| **VALIDATED** | Perturbation confirms predicted direction (>90th percentile vs. null) AND disease tissue is consistent |
-| **PARTIALLY SUPPORTED** | Effect is real but modest (50th-90th percentile), or direction matches only in a different cell type |
-| **CONTRADICTED** | Perturbation data shows significant effect in the opposite direction |
-| **WEAK** | Perturbation data exists but downstream gene is not more affected than random genes |
-| **UNTESTABLE** | No perturbation data available for the upstream gene |
-| **CELL-TYPE CAVEAT** | Evidence exists but only in a different cell type than claimed |
+Each claim gets a confidence grade: VALIDATED, PARTIALLY_SUPPORTED, WEAK, CONTRADICTED, or UNTESTABLE.
 
 ## Quick start
 
-### Requirements
+```bash
+# 1. Install dependencies
+pip3 install scanpy anndata pandas pyarrow numpy scipy requests
 
-Python 3.9+ with pip.
+# 2. Run setup (downloads ~2.7 GB Perturb-seq data from Figshare)
+python3 setup.py
 
-### Install dependencies
+# 3. Validate your claims (Tier 1 only)
+python3 truthseq_validate.py \
+    --claims your_claims.csv \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet \
+    --output my_results
+```
+
+## Adding disease context (Tier 2)
+
+TruthSeq includes a dataset registry and search tool to help you find expression data for your disease of interest.
 
 ```bash
-pip install pandas pyarrow requests scipy matplotlib seaborn
+# Search for available datasets
+python3 dataset_search.py --query "autism brain RNA-seq" --verbose
+
+# Or just specify the disease and TruthSeq will check the registry
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --disease "autism" \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet
 ```
 
-### Download reference data
-
-```bash
-# Replogle Perturb-seq atlas — pre-processed knockdown effects (~9,867 genes)
-wget -q -O replogle_knockdown_effects.parquet \
-  "https://github.com/rsflinn/truthseq-data/releases/download/v1.0/replogle_knockdown_effects.parquet"
-
-# PsychENCODE ASD differential expression by cell type
-wget -q -O psychencode_asd_de.parquet \
-  "https://github.com/rsflinn/truthseq-data/releases/download/v1.0/psychencode_asd_de.parquet"
-
-# Gene symbol to Ensembl ID mapping
-wget -q -O gene_id_mapping.tsv \
-  "https://github.com/rsflinn/truthseq-data/releases/download/v1.0/gene_id_mapping.tsv"
-
-# Validation script
-wget -q -O truthseq_validate.py \
-  "https://github.com/rsflinn/truthseq-data/releases/download/v1.0/truthseq_validate.py"
-```
-
-### Prepare your claims
-
-Create a CSV file with your regulatory predictions:
-
-```csv
-upstream_gene,downstream_gene,predicted_direction,cell_type_context,source
-MYT1L,MEF2C,DOWN,neuron,GRN inference
-TCF4,MEF2C,DOWN,neuron,GRN inference
-EP300,MYT1L,DOWN,neuron,chromatin regulation
-MEF2C,KCNA2,DOWN,neuron,target gene analysis
-MECP2,CDKL5,DOWN,neuron,literature
-```
-
-| Column | Required | Description |
-|---|---|---|
-| upstream_gene | Yes | Gene symbol of the claimed regulator |
-| downstream_gene | Yes | Gene symbol of the claimed target |
-| predicted_direction | Yes | DOWN or UP — predicted effect on downstream when upstream is knocked down |
-| cell_type_context | No | Tissue or cell type context (e.g., "neuron", "excitatory_neuron") |
-| source | No | Where this claim came from |
-
-If you run the script without a claims file, it uses a built-in demo set.
-
-### Run
+If TruthSeq finds matching datasets in the registry but you don't have one downloaded locally, it tells you exactly what's available and how to get it. Once you have a disease expression file, supply it directly:
 
 ```bash
 python3 truthseq_validate.py \
-  --claims claims.csv \
-  --replogle replogle_knockdown_effects.parquet \
-  --psychencode psychencode_asd_de.parquet \
-  --gene-map gene_id_mapping.tsv \
-  --output truthseq_report
+    --claims claims.csv \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet \
+    --disease-expr my_disease_de.tsv \
+    --output results
 ```
 
-Options:
-- `--skip-ot` skips Open Targets API queries (faster, offline)
-- `--skip-base-rate` skips the 1,000-iteration null simulation (faster)
+See `format_spec.md` for the expected file format.
 
-### Output
+## Finding datasets
 
-The script produces three files in the output directory:
+The dataset search tool queries GEO (NCBI) and ArrayExpress (EBI) for publicly available expression datasets:
 
-- `truthseq_results.csv` — Full evidence table with one row per claim, all scores and evidence narratives
-- `truthseq_summary.md` — Human-readable report with overall scorecard, per-claim evidence and base-rate comparison
-- `truthseq_heatmap.png` — Visual summary color-coded by confidence grade
+```bash
+# Search broadly
+python3 dataset_search.py --query "Parkinson disease brain RNA-seq"
 
-## Example output
+# Search with full download instructions
+python3 dataset_search.py --query "breast cancer differential expression" --verbose
 
-Running the demo claims (8 regulatory predictions from an autism gene network hypothesis):
+# Add new results to the local registry
+python3 dataset_search.py --query "schizophrenia single-cell" --update-registry
 
-```
-============================================================
-TruthSeq Validation Complete
-============================================================
-  VALIDATED                 0
-  PARTIALLY_SUPPORTED       7
-  CELL_TYPE_CAVEAT          0
-  WEAK                      1
-  CONTRADICTED              0
-  UNTESTABLE                0
-  TOTAL                     8
+# Search local registry only (no API calls)
+python3 dataset_search.py --query "perturbation" --registry-only
 ```
 
-Seven claims are PARTIALLY SUPPORTED: no perturbation effect in K562 cells (expected — these are neuron-specific relationships tested in a leukemia cell line), but the downstream genes are dysregulated in ASD postmortem brain. One claim is WEAK (MECP2 → CDKL5): the tool correctly flags that the predicted regulatory direction is unsupported — CDKL5 phosphorylates MECP2, not the reverse.
+The registry (`dataset_registry.csv`) ships with curated entries for major disease areas and perturbation datasets. You can add your own entries or update it automatically by running searches with `--update-registry`.
 
-## Fallback mode
+## Claims file format
 
-If the reference data files can't be downloaded, TruthSeq falls back to querying the Open Targets API only (Tier 3) and reports which tiers couldn't be checked. The output explicitly states what data would be needed for full validation.
+CSV with these columns:
 
-## Limitations
+| Column | Required | Description |
+|--------|----------|-------------|
+| upstream_gene | yes | Gene symbol of the predicted regulator |
+| downstream_gene | yes | Gene symbol of the predicted target |
+| predicted_direction | yes | UP or DOWN (predicted effect of upstream on downstream) |
+| cell_type_context | no | Cell type where the regulation is predicted to occur |
+| source | no | Where the prediction came from |
 
-**Cell-type mismatch** is the primary limitation. The Replogle atlas uses K562 cells (a leukemia line), not neurons. Gene regulatory relationships differ across cell types, and TruthSeq flags this mismatch rather than hiding it. As neuronal Perturb-seq datasets grow, the reference data can be updated.
+Example:
+```csv
+upstream_gene,downstream_gene,predicted_direction,cell_type_context,source
+MEF2C,SCN2A,DOWN,excitatory_neuron,GRN_inference
+TCF4,KCNA1,DOWN,inhibitory_neuron,co-expression
+GATA1,HBB,DOWN,,published_literature
+```
 
-**Pairwise only.** TruthSeq validates individual gene-gene claims, not network-level properties like cascade amplification or multi-step propagation. Extending to multi-hop validation is a future direction.
+## How grading works
 
-**Perturbation ≠ direct regulation.** A knockdown effect shows that gene X's expression affects gene Y, but the mechanism could be indirect.
+TruthSeq combines evidence across tiers:
 
-## AI agent integration
+- **VALIDATED**: Perturbation confirms direction (top 10% effect vs null) AND disease tissue expression is consistent.
+- **PARTIALLY_SUPPORTED**: Perturbation confirms direction but effect is modest, OR perturbation data unavailable but disease tissue evidence supports the claim.
+- **WEAK**: Perturbation was tested but downstream gene wasn't notably affected, or evidence is insufficient.
+- **CONTRADICTED**: Perturbation shows a significant effect in the opposite direction from the prediction.
+- **UNTESTABLE**: Upstream gene wasn't in the Perturb-seq atlas and no other evidence available.
 
-TruthSeq is designed to be executed by AI coding agents. A SKILL.md file is included that provides step-by-step instructions any agent can follow to download the data, run the validation and interpret results. See [`truthseq_SKILL.md`](truthseq_SKILL.md) in this repository.
+## Important caveats
+
+The Replogle atlas uses K562 cells (chronic myeloid leukemia line). Regulatory relationships specific to other cell types (neurons, immune cells, etc.) may not show up. A WEAK grade doesn't mean the relationship is wrong — it means it wasn't detectable in this system. Disease tissue expression (Tier 2) can help fill this gap for cell-type-specific claims.
+
+## Contributing datasets
+
+If you know of a publicly available expression dataset that should be in the registry, add a row to `dataset_registry.csv` with the accession, description, and download instructions, then submit a pull request.
 
 ## Data sources
 
-All reference data is derived from published, publicly available sources:
-
-- **Replogle Perturb-seq atlas**: Replogle JM, et al. Mapping information-rich genotype-phenotype landscapes with genome-scale Perturb-seq. *Cell*. 2022;185(14):2559-2575. GEO: GSE132080
-- **PsychENCODE**: Gandal MJ, et al. Transcriptome-wide isoform-level dysregulation in ASD, schizophrenia, and bipolar disorder. *Science*. 2018;362(6420):eaat8127
-- **Open Targets Platform**: https://platform.opentargets.org (queried live at runtime)
-
-## License
-
-MIT
+- Replogle et al. 2022. "Mapping information-rich genotype-phenotype landscapes with genome-scale Perturb-seq." *Cell* 185, 5689-5710. [Figshare](https://figshare.com/articles/dataset/Replogle_GWPS/19968745)
+- Open Targets Platform: platform.opentargets.org
+- NCBI GEO: ncbi.nlm.nih.gov/geo
+- EMBL-EBI ArrayExpress: ebi.ac.uk/biostudies/arrayexpress
