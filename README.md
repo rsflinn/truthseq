@@ -69,15 +69,15 @@ TruthSeq reads a simple CSV where each row is one prediction: "I think this gene
 
 ```csv
 upstream_gene,downstream_gene,predicted_direction,source
-GATA1,HBB,DOWN,textbook_example
-TP53,CDKN1A,DOWN,published_literature
-MYC,ENO1,DOWN,my_analysis
+SLC30A1,MT2A,UP,known_biology
+GATA1,TYROBP,UP,known_biology
+CHMP6,SOD2,UP,my_analysis
 ```
 
 Quick translation:
 - **upstream_gene** — the gene you think is the regulator (the one doing the controlling)
 - **downstream_gene** — the gene you think is being controlled
-- **predicted_direction** — when the regulator is active, does the target go UP or DOWN?
+- **predicted_direction** — when the regulator is removed, does the target go UP or DOWN?
 - **source** — where the prediction came from (optional, just for your notes)
 
 Run it:
@@ -102,7 +102,7 @@ python3 truthseq_validate.py \
     --output example_results
 ```
 
-What to expect: GATA1 → HBB (a well-established blood cell relationship) should score well. PAX6 → COL1A1 (an eye gene supposedly regulating a connective tissue gene) should score low — those genes have no known connection. The wrong-direction controls should come back CONTRADICTED.
+What to expect: SLC30A1 → MT2A (zinc transporter knockout triggers metallothionein response) and GATA1 → TYROBP (blood cell master regulator derepresses myeloid genes) should score VALIDATED. The wrong-direction controls should come back CONTRADICTED. BRCA1 and RB1 claims will score WEAK — real genes, but their effects are too diffuse to stand out in this dataset. TP53 isn't in the knockdown data at all, so it returns UNTESTABLE.
 
 ## How the grades work
 
