@@ -28,67 +28,8 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      - name: Scan for new datasets based on registry diseases
-        run: |
-          python3 -c "
-          import pandas as pd
-          import subprocess, sys
-
-          # Extract unique disease terms from the existing registry
-          df = pd.read_csv('dataset_registry.csv')
-          diseases = set()
-
-          # Terms too vague to produce useful GEO results
-          SKIP_TERMS = {'healthy', 'developmental', 'cancer'}
-          # 'cancer' is too broad -- specific cancer types (breast cancer, etc.) are fine
-
-          for d in df['disease'].dropna().unique():
-              for term in d.split(';'):
-                  term = term.strip()
-                  if term and term not in SKIP_TERMS:
-                      diseases.add(term)
-
-          print(f'Searching for {len(diseases)} disease categories: {sorted(diseases)}')
-
-          # Search GEO/ArrayExpress for each disease (human only by default)
-          for disease in sorted(diseases):
-              print(f'\n--- Searching for: {disease} ---')
-              subprocess.run([
-                  'python3', 'dataset_search.py',
-                  '--query', f'{disease} differential expression',
-                  '--update-registry',
-                  '--max-results', '10',
-              ])
-
-          # Always search for new perturbation datasets (relevant to all users)
-          print('\n--- Searching for: perturbation datasets ---')
-          subprocess.run([
-              'python3', 'dataset_search.py',
-              '--query', 'CRISPR perturbation screen gene expression',
-              '--update-registry',
-              '--max-results', '10',
-          ])
-          "
-
-      - name: Deduplicate registry
-        run: |
-          python3 -c "
-          import pandas as pd
-          df = pd.read_csv('dataset_registry.csv')
-          before = len(df)
-          df['accession'] = df['accession'].astype(str).str.strip()
-          df['dataset_id'] = df['dataset_id'].astype(str).str.strip()
-          # Dedup on dataset_id (unique per entry). Using accession alone
-          # would incorrectly merge entries that share a deposit (e.g.,
-          # replogle_k562 and replogle_rpe1 both reference Figshare 19968745).
-          df = df.drop_duplicates(subset='dataset_id', keep='first')
-          after = len(df)
-          df.to_csv('dataset_registry.csv', index=False)
-          if before != after:
-              print(f'Removed {before - after} duplicate entries ({before} -> {after})')
-          else:
-              print(f'No duplicates found ({after} entries)')
-          "
+      - name: Search GEO/ArrayExpress and update registry
+        run: python3 update_registry_workflow.py
 
       - name: Check for changes
         id: changes
