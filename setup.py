@@ -41,9 +41,9 @@ log = logging.getLogger(__name__)
 # Figshare download URL for the Replogle pseudo-bulk h5ad
 # Source: Replogle et al. 2022, "Mapping information-rich genotype-phenotype
 # landscapes with genome-scale Perturb-seq" (Cell)
-FIGSHARE_URL = "https://figshare.com/ndownloader/files/35773219"
+FIGSHARE_URL = "https://ndownloader.figshare.com/files/35773217"
 H5AD_FILENAME = "K562_gwps_normalized_bulk_01.h5ad"
-H5AD_SIZE_MB = 2700  # ~2.7 GB
+H5AD_SIZE_MB = 357  # ~357 MB (pseudo-bulk, not single-cell)
 
 # Output filenames
 EFFECTS_PARQUET = "replogle_knockdown_effects.parquet"
@@ -56,7 +56,7 @@ def check_status(work_dir):
     print("\n=== TruthSeq Data Status ===\n")
 
     files = {
-        H5AD_FILENAME: "Replogle h5ad (raw source, ~2.7 GB)",
+        H5AD_FILENAME: "Replogle h5ad (pseudo-bulk source, ~357 MB)",
         EFFECTS_PARQUET: "Knockdown effects parquet (Tier 1 data)",
         STATS_PARQUET: "Knockdown distribution stats (for percentile calculations)",
         GENE_MAP_FILE: "Gene ID mapping (for Open Targets, Tier 3)",
@@ -94,7 +94,7 @@ def download_h5ad(work_dir):
 
     if os.path.exists(output_path):
         size_mb = os.path.getsize(output_path) / 1024 / 1024
-        if size_mb > 100:  # Sanity check: file should be >100 MB
+        if size_mb > 50:  # Sanity check: file should be >50 MB
             log.info(f"h5ad file already exists: {output_path} ({size_mb:.0f} MB)")
             return output_path
         else:
@@ -232,7 +232,7 @@ def process_h5ad(h5ad_path, work_dir):
     unique_kd_genes = sorted(set(gene_labels))
     all_pairs = []
     all_stats = []
-    z_threshold = 1.0
+    z_threshold = 0.5  # Store more pairs to avoid filtering out real biology
 
     for i, kd_gene in enumerate(unique_kd_genes):
         if (i + 1) % 500 == 0:
@@ -421,7 +421,7 @@ See format_spec.md for disease expression file format.
     print("  Preparing Replogle Perturb-seq reference data")
     print("=" * 70)
     print()
-    print("  This will download ~2.7 GB of Perturb-seq data from Figshare")
+    print("  This will download ~357 MB of Perturb-seq data from Figshare")
     print("  and process it into parquet files for fast validation.")
     print()
     print(f"  Working directory: {work_dir}")

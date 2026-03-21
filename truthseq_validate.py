@@ -126,8 +126,15 @@ def compute_percentile_from_stats(z_score, stats_row):
         return None
 
     # Interpolate: find where abs_z falls in the quantile distribution
-    quantile_points = np.array(quantile_points)
-    quantile_values = np.array(quantile_values)
+    quantile_points = np.array(quantile_points, dtype=float)
+    quantile_values = np.array(quantile_values, dtype=float)
+
+    # Filter out NaN values
+    valid = ~np.isnan(quantile_values)
+    if not valid.any():
+        return None
+    quantile_points = quantile_points[valid]
+    quantile_values = quantile_values[valid]
 
     if abs_z <= quantile_values[0]:
         return float(quantile_points[0])
@@ -136,7 +143,7 @@ def compute_percentile_from_stats(z_score, stats_row):
 
     # Linear interpolation between quantile breakpoints
     percentile = float(np.interp(abs_z, quantile_values, quantile_points))
-    return percentile
+    return None if np.isnan(percentile) else percentile
 
 
 def validate_perturbation(claims, replogle_df, stats_df=None):
@@ -180,7 +187,9 @@ def validate_perturbation(claims, replogle_df, stats_df=None):
             observed_z = float(target_hit.iloc[0]['z_score'])
             cell_line = target_hit.iloc[0].get('cell_line', 'K562')
 
-            observed_dir = "DOWN" if observed_z < 0 else "UP"
+            # Invert: z < 0 means KO reduced target, so gene normally activates it (UP)
+            # z > 0 means KO increased target, so gene normally represses it (DOWN)
+            observed_dir = "UP" if observed_z < 0 else "DOWN"
             direction_match = (observed_dir == predicted_dir)
 
             # Compute percentile rank
@@ -935,21 +944,21 @@ def generate_heatmap(results_df, output_dir):
 
 def create_demo_claims(output_path):
     demo = pd.DataFrame([
-        {"upstream_gene": "MYT1L", "downstream_gene": "MEF2C", "predicted_direction": "DOWN",
+        {"upstream_gene": "MYT1L", "downstream_gene": "MEF2C", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "GRN inference"},
-        {"upstream_gene": "TCF4", "downstream_gene": "MEF2C", "predicted_direction": "DOWN",
+        {"upstream_gene": "TCF4", "downstream_gene": "MEF2C", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "GRN inference"},
-        {"upstream_gene": "MYT1L", "downstream_gene": "SCN2A", "predicted_direction": "DOWN",
+        {"upstream_gene": "MYT1L", "downstream_gene": "SCN2A", "predicted_direction": "UP",
          "cell_type_context": "excitatory_neuron", "source": "co-expression"},
-        {"upstream_gene": "EP300", "downstream_gene": "MYT1L", "predicted_direction": "DOWN",
+        {"upstream_gene": "EP300", "downstream_gene": "MYT1L", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "chromatin regulation"},
-        {"upstream_gene": "FOXP1", "downstream_gene": "TCF4", "predicted_direction": "DOWN",
+        {"upstream_gene": "FOXP1", "downstream_gene": "TCF4", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "TF binding prediction"},
-        {"upstream_gene": "MEF2C", "downstream_gene": "KCNA2", "predicted_direction": "DOWN",
+        {"upstream_gene": "MEF2C", "downstream_gene": "KCNA2", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "target gene analysis"},
-        {"upstream_gene": "MEF2C", "downstream_gene": "GRIN2B", "predicted_direction": "DOWN",
+        {"upstream_gene": "MEF2C", "downstream_gene": "GRIN2B", "predicted_direction": "UP",
          "cell_type_context": "excitatory_neuron", "source": "target gene analysis"},
-        {"upstream_gene": "MECP2", "downstream_gene": "CDKL5", "predicted_direction": "DOWN",
+        {"upstream_gene": "MECP2", "downstream_gene": "CDKL5", "predicted_direction": "UP",
          "cell_type_context": "neuron", "source": "literature"},
     ])
     demo.to_csv(output_path, index=False)

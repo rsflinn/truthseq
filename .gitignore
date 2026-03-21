@@ -19,3 +19,24 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Old/superseded scripts
+01_download_replogle.py
+03_build_gene_map.py
+fix_gene_names.py
+fix_replogle.py
+inspect_data.py
+submit_to_clawrxiv.py
+truthseq_validate_v2.py
+
+# Temp/draft files
+README_draft.md
+repo_description_draft.txt
+dataset_registry.csv.bak
+tier2_test_claims.csv
+truthseq_test_claims.csv
+
+# Test run directories
+test_run/
+test_run2/
+disease_catalog.json

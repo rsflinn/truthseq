@@ -48,7 +48,7 @@ It can't test broader biological questions like "does this mutation cause drug r
 ## What you need
 
 - Python 3.8 or later (type `python3 --version` in your terminal to check)
-- About 3 GB of free disk space for the experimental dataset
+- About 500 MB of free disk space for the experimental dataset
 - A CSV file of gene regulatory predictions to test (or use the included example to try it out)
 
 ## Setup
@@ -57,11 +57,11 @@ It can't test broader biological questions like "does this mutation cause drug r
 # Install the Python libraries TruthSeq needs
 pip3 install scanpy anndata pandas pyarrow numpy scipy requests
 
-# Download the experimental dataset (~2.7 GB from Figshare, a public data repository)
+# Download the experimental dataset (~357 MB from Figshare, a public data repository)
 python3 setup.py
 ```
 
-The setup script downloads the Replogle Perturb-seq atlas from Figshare. This is real lab data, not a model or simulation. It takes a few minutes depending on your connection.
+The setup script downloads the Replogle Perturb-seq atlas from Figshare (~357 MB). This is real lab data, not a model or simulation. It takes a few minutes depending on your connection.
 
 ## Your first validation
 
@@ -69,15 +69,15 @@ TruthSeq reads a simple CSV where each row is one prediction: "I think this gene
 
 ```csv
 upstream_gene,downstream_gene,predicted_direction,source
-SLC30A1,MT2A,UP,known_biology
-GATA1,TYROBP,UP,known_biology
-CHMP6,SOD2,UP,my_analysis
+SLC30A1,MT2A,DOWN,known_biology
+GATA1,TYROBP,DOWN,known_biology
+CHMP6,SOD2,DOWN,my_analysis
 ```
 
 Quick translation:
 - **upstream_gene** — the gene you think is the regulator (the one doing the controlling)
 - **downstream_gene** — the gene you think is being controlled
-- **predicted_direction** — when the regulator is removed, does the target go UP or DOWN?
+- **predicted_direction** — when the regulator is active, does the target go UP or DOWN?
 - **source** — where the prediction came from (optional, just for your notes)
 
 Run it:
