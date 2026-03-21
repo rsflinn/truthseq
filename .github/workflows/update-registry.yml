@@ -37,20 +37,25 @@ jobs:
           # Extract unique disease terms from the existing registry
           df = pd.read_csv('dataset_registry.csv')
           diseases = set()
+
+          # Terms too vague to produce useful GEO results
+          SKIP_TERMS = {'healthy', 'developmental', 'cancer'}
+          # 'cancer' is too broad -- specific cancer types (breast cancer, etc.) are fine
+
           for d in df['disease'].dropna().unique():
               for term in d.split(';'):
                   term = term.strip()
-                  if term and term != 'healthy':
+                  if term and term not in SKIP_TERMS:
                       diseases.add(term)
 
-          print(f'Found {len(diseases)} disease categories in registry: {diseases}')
+          print(f'Searching for {len(diseases)} disease categories: {sorted(diseases)}')
 
-          # Search GEO/ArrayExpress for each disease
+          # Search GEO/ArrayExpress for each disease (human only by default)
           for disease in sorted(diseases):
               print(f'\n--- Searching for: {disease} ---')
               subprocess.run([
                   'python3', 'dataset_search.py',
-                  '--query', f'{disease} differential expression RNA-seq',
+                  '--query', f'{disease} differential expression',
                   '--update-registry',
                   '--max-results', '10',
               ])
@@ -87,7 +92,8 @@ jobs:
             Automated weekly scan found new datasets via GEO/ArrayExpress search.
 
             The scan checked GEO and ArrayExpress for each disease already in the
-            registry, plus general perturbation datasets. As users add new disease
+            registry, plus general perturbation datasets. Results are filtered to
+            human species and datasets with 10+ samples. As users add new disease
             areas to the registry, future scans will automatically cover them.
 
             ~${{ steps.changes.outputs.added }} new entries added to `dataset_registry.csv`.

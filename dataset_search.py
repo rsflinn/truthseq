@@ -23,6 +23,9 @@ Usage:
 
     # Update registry with new GEO results
     python3 dataset_search.py --query "autism single-cell RNA-seq brain" --update-registry
+
+    # Include non-human species (default is human only)
+    python3 dataset_search.py --query "autism" --all-species
 """
 
 import os
@@ -40,6 +43,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 REGISTRY_PATH = os.path.join(os.path.dirname(__file__), "dataset_registry.csv")
+
+# Minimum sample count for automated registry updates.
+# Datasets with fewer samples than this are skipped during --update-registry
+# to avoid adding underpowered pilot studies. Does not affect display results.
+MIN_SAMPLES_FOR_REGISTRY = 10
 
 
 # ============================================================
@@ -68,19 +76,19 @@ def search_registry(query, registry_path=REGISTRY_PATH):
         row = df.iloc[idx]
         results.append({
             'source': 'registry',
-            'dataset_id': row.get('dataset_id', ''),
-            'accession': row.get('accession', ''),
-            'description': row.get('description', ''),
-            'disease': row.get('disease', ''),
-            'data_type': row.get('data_type', ''),
-            'n_samples': row.get('n_samples', ''),
-            'species': row.get('species', ''),
-            'tissue': row.get('tissue', ''),
-            'access_type': row.get('access_type', ''),
-            'download_url': row.get('download_url', ''),
-            'download_instructions': row.get('download_instructions', ''),
-            'paper_doi': row.get('paper_doi', ''),
-            'paper_citation': row.get('paper_citation', ''),
+            'dataset_id': str(row.get('dataset_id', '')),
+            'accession': str(row.get('accession', '')),
+            'description': str(row.get('description', '')),
+            'disease': str(row.get('disease', '')),
+            'data_type': str(row.get('data_type', '')),
+            'n_samples': str(row.get('n_samples', '')),
+            'species': str(row.get('species', '')),
+            'tissue': str(row.get('tissue', '')),
+            'access_type': str(row.get('access_type', '')),
+            'download_url': str(row.get('download_url', '')),
+            'download_instructions': str(row.get('download_instructions', '')),
+            'paper_doi': str(row.get('paper_doi', '')),
+            'paper_citation': str(row.get('paper_citation', '')),
             'match_score': score,
         })
 
@@ -91,7 +99,7 @@ def search_registry(query, registry_path=REGISTRY_PATH):
 # GEO Search (NCBI E-utilities)
 # ============================================================
 
-def search_geo(query, max_results=20):
+def search_geo(query, max_results=20, human_only=True):
     """
     Search NCBI GEO for datasets matching the query.
     Uses E-utilities API (free, no authentication required).
@@ -104,8 +112,11 @@ def search_geo(query, max_results=20):
     # Filter for expression profiling datasets
     geo_query = f'({query}) AND ("expression profiling by high throughput sequencing"[DataSet Type] OR "expression profiling by array"[DataSet Type])'
 
+    if human_only:
+        geo_query += ' AND "Homo sapiens"[Organism]'
+
     # Step 1: Search for matching GEO DataSets
-    log.info(f"Searching GEO for: {query}")
+    log.info(f"Searching GEO for: {query}" + (" (human only)" if human_only else ""))
     try:
         search_resp = requests.get(f"{base_url}/esearch.fcgi", params={
             'db': 'gds',
@@ -186,15 +197,24 @@ def search_geo(query, max_results=20):
 # ============================================================
 
 def search_arrayexpress(query, max_results=10):
-    """Search EMBL-EBI ArrayExpress/BioStudies for datasets."""
+    """
+    Search EMBL-EBI ArrayExpress for actual expression datasets.
+
+    The BioStudies API also indexes PubMed Central papers, which are
+    not downloadable datasets. We filter those out by requiring
+    accessions that start with 'E-' (actual ArrayExpress experiments).
+    """
     import requests
 
     log.info(f"Searching ArrayExpress for: {query}")
     try:
+        # Request more than we need since we'll filter out non-datasets
+        fetch_count = max_results * 3
+
         resp = requests.get("https://www.ebi.ac.uk/biostudies/api/v1/search", params={
-            'query': query,
+            'query': f'{query} AND type:arrayexpress',
             'type': 'study',
-            'pageSize': max_results,
+            'pageSize': fetch_count,
         }, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -204,10 +224,18 @@ def search_arrayexpress(query, max_results=10):
         log.info(f"  Found {total} ArrayExpress results ({len(hits)} retrieved)")
 
         results = []
+        skipped = 0
         for hit in hits:
             accession = hit.get('accession', '')
             title = hit.get('title', '')
             description = hit.get('content', '') or title
+
+            # Filter: only keep actual ArrayExpress experiments
+            # Real experiments have accessions like E-MTAB-XXXX, E-GEOD-XXXX, etc.
+            # PubMed Central papers have accessions like S-EPMCXXXXXXX
+            if not accession.startswith('E-'):
+                skipped += 1
+                continue
 
             results.append({
                 'source': 'ArrayExpress',
@@ -226,6 +254,12 @@ def search_arrayexpress(query, max_results=10):
                 'paper_citation': '',
                 'match_score': 0,
             })
+
+            if len(results) >= max_results:
+                break
+
+        if skipped > 0:
+            log.info(f"  Filtered out {skipped} non-dataset results (papers, reviews)")
 
         return results
 
@@ -252,6 +286,8 @@ def display_results(results, verbose=False):
         access_tag = "[OPEN]" if r.get('access_type') == 'open' else "[LOGIN REQUIRED]"
         print(f"  {i}. {r['accession']} {access_tag}")
         print(f"     Source: {r['source']} | Type: {r['data_type']} | Samples: {r['n_samples']}")
+        if r.get('species'):
+            print(f"     Species: {r['species']}")
         print(f"     {r['description'][:120]}")
         if r.get('paper_citation'):
             print(f"     Paper: {r['paper_citation']}")
@@ -262,35 +298,77 @@ def display_results(results, verbose=False):
         print()
 
 
-def update_registry(new_results, registry_path=REGISTRY_PATH):
-    """Add new results to the registry, skipping duplicates."""
+def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SAMPLES_FOR_REGISTRY):
+    """
+    Add new results to the registry, skipping duplicates.
+
+    Deduplication: compares accessions as strings to avoid type mismatches
+    (e.g., pandas reading '19968745' as int vs string from search results).
+
+    Filtering: skips datasets with fewer than min_samples samples to avoid
+    adding underpowered pilot studies during automated scans.
+    """
     if not new_results:
         return 0
 
     existing = pd.read_csv(registry_path) if os.path.exists(registry_path) else pd.DataFrame()
-    existing_accessions = set(existing['accession'].tolist()) if 'accession' in existing.columns else set()
+
+    # Build set of existing accessions, cast to string to avoid type mismatches
+    existing_accessions = set()
+    if 'accession' in existing.columns:
+        existing_accessions = set(str(a).strip() for a in existing['accession'].tolist())
 
     new_rows = []
+    skipped_small = 0
+    skipped_dup = 0
     for r in new_results:
-        if r['accession'] not in existing_accessions:
-            new_rows.append({
-                'dataset_id': r.get('dataset_id', ''),
-                'disease': r.get('disease', ''),
-                'data_type': r.get('data_type', ''),
-                'source': r.get('source', ''),
-                'accession': r.get('accession', ''),
-                'description': r.get('description', ''),
-                'n_samples': r.get('n_samples', ''),
-                'species': r.get('species', ''),
-                'tissue': r.get('tissue', ''),
-                'cell_types': '',
-                'access_type': r.get('access_type', 'open'),
-                'download_url': r.get('download_url', ''),
-                'download_instructions': r.get('download_instructions', ''),
-                'paper_doi': r.get('paper_doi', ''),
-                'paper_citation': r.get('paper_citation', ''),
-                'last_verified': datetime.now().strftime('%Y-%m-%d'),
-            })
+        acc = str(r.get('accession', '')).strip()
+
+        # Skip if already in registry
+        if acc in existing_accessions:
+            skipped_dup += 1
+            continue
+
+        # Skip registry search results (they're already in the registry)
+        if r.get('source') == 'registry':
+            continue
+
+        # For automated updates: skip datasets below minimum sample count
+        if min_samples > 0:
+            try:
+                n = int(str(r.get('n_samples', '0')).replace('~', '').replace(',', '').replace('>',''))
+            except (ValueError, TypeError):
+                n = 0
+            if n > 0 and n < min_samples:
+                skipped_small += 1
+                continue
+
+        new_rows.append({
+            'dataset_id': r.get('dataset_id', ''),
+            'disease': r.get('disease', ''),
+            'data_type': r.get('data_type', ''),
+            'source': r.get('source', ''),
+            'accession': acc,
+            'description': r.get('description', ''),
+            'n_samples': r.get('n_samples', ''),
+            'species': r.get('species', ''),
+            'tissue': r.get('tissue', ''),
+            'cell_types': '',
+            'access_type': r.get('access_type', 'open'),
+            'download_url': r.get('download_url', ''),
+            'download_instructions': r.get('download_instructions', ''),
+            'paper_doi': r.get('paper_doi', ''),
+            'paper_citation': r.get('paper_citation', ''),
+            'last_verified': datetime.now().strftime('%Y-%m-%d'),
+        })
+
+        # Track this accession so we don't add it twice in one run
+        existing_accessions.add(acc)
+
+    if skipped_small > 0:
+        log.info(f"  Skipped {skipped_small} datasets with <{min_samples} samples")
+    if skipped_dup > 0:
+        log.info(f"  Skipped {skipped_dup} datasets already in registry")
 
     if new_rows:
         new_df = pd.DataFrame(new_rows)
@@ -298,7 +376,7 @@ def update_registry(new_results, registry_path=REGISTRY_PATH):
         combined.to_csv(registry_path, index=False)
         log.info(f"Added {len(new_rows)} new datasets to registry (total: {len(combined)})")
     else:
-        log.info("No new datasets to add (all already in registry)")
+        log.info("No new datasets to add (all already in registry or filtered out)")
 
     return len(new_rows)
 
@@ -307,7 +385,7 @@ def update_registry(new_results, registry_path=REGISTRY_PATH):
 # Main: Combined search
 # ============================================================
 
-def find_datasets(query, registry_only=False, max_results=20, verbose=False):
+def find_datasets(query, registry_only=False, max_results=20, verbose=False, human_only=True):
     """
     Search all sources for datasets matching the query.
     Returns combined, deduplicated results.
@@ -320,18 +398,18 @@ def find_datasets(query, registry_only=False, max_results=20, verbose=False):
 
     if not registry_only:
         # Search GEO
-        geo_results = search_geo(query, max_results=max_results)
+        geo_results = search_geo(query, max_results=max_results, human_only=human_only)
         all_results.extend(geo_results)
 
         # Search ArrayExpress
         ae_results = search_arrayexpress(query, max_results=max_results // 2)
         all_results.extend(ae_results)
 
-    # Deduplicate by accession
+    # Deduplicate by accession (cast to string for safe comparison)
     seen = set()
     deduped = []
     for r in all_results:
-        acc = r.get('accession', '')
+        acc = str(r.get('accession', '')).strip()
         if acc and acc not in seen:
             seen.add(acc)
             deduped.append(r)
@@ -342,7 +420,7 @@ def find_datasets(query, registry_only=False, max_results=20, verbose=False):
     def sort_key(r):
         is_registry = 1 if r['source'] == 'registry' else 0
         try:
-            n = int(str(r.get('n_samples', '0')).replace('~', '').replace(',', ''))
+            n = int(str(r.get('n_samples', '0')).replace('~', '').replace(',', '').replace('>',''))
         except (ValueError, TypeError):
             n = 0
         return (is_registry, n)
@@ -363,12 +441,14 @@ Examples:
     python3 dataset_search.py --query "breast cancer differential expression"
     python3 dataset_search.py --query "schizophrenia" --update-registry
     python3 dataset_search.py --query "Parkinson" --registry-only
+    python3 dataset_search.py --query "zebrafish heart" --all-species
         """
     )
     parser.add_argument('--query', required=True, help='Search terms (disease, tissue, method, etc.)')
     parser.add_argument('--registry-only', action='store_true', help='Search local registry only, no API calls')
     parser.add_argument('--update-registry', action='store_true', help='Add new GEO/AE results to the local registry')
     parser.add_argument('--max-results', type=int, default=20, help='Max results per source (default: 20)')
+    parser.add_argument('--all-species', action='store_true', help='Include non-human species (default: human only)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Show download instructions')
     parser.add_argument('--json', action='store_true', help='Output as JSON instead of text')
 
@@ -379,6 +459,7 @@ Examples:
         registry_only=args.registry_only,
         max_results=args.max_results,
         verbose=args.verbose,
+        human_only=not args.all_species,
     )
 
     if args.json:
