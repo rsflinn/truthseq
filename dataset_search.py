@@ -302,8 +302,10 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
     """
     Add new results to the registry, skipping duplicates.
 
-    Deduplication: compares accessions as strings to avoid type mismatches
-    (e.g., pandas reading '19968745' as int vs string from search results).
+    Deduplication uses dataset_id (unique per entry) as the primary key,
+    with accession as a secondary check. This avoids incorrectly merging
+    entries that share an accession (e.g., replogle_k562 and replogle_rpe1
+    both reference Figshare deposit 19968745).
 
     Filtering: skips datasets with fewer than min_samples samples to avoid
     adding underpowered pilot studies during automated scans.
@@ -313,18 +315,24 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
 
     existing = pd.read_csv(registry_path) if os.path.exists(registry_path) else pd.DataFrame()
 
-    # Normalize accession column to string to prevent type-mismatch duplicates
-    # (pandas may read '19968745' as int64, while search results return it as str)
+    # Normalize string columns to prevent type-mismatch duplicates
     if 'accession' in existing.columns:
         existing['accession'] = existing['accession'].astype(str).str.strip()
-        # Remove any pre-existing duplicates in the CSV
+    if 'dataset_id' in existing.columns:
+        existing['dataset_id'] = existing['dataset_id'].astype(str).str.strip()
+        # Remove true duplicates (same dataset_id = same entry)
         before_dedup = len(existing)
-        existing = existing.drop_duplicates(subset='accession', keep='first')
+        existing = existing.drop_duplicates(subset='dataset_id', keep='first')
         if len(existing) < before_dedup:
             log.info(f"  Cleaned {before_dedup - len(existing)} duplicate entries from registry")
 
-    # Build set of existing accessions
+    # Build sets of existing identifiers for skip logic.
+    # Check BOTH dataset_id and accession so that a GEO result matching
+    # a curated entry by accession (e.g., GSE132672) is still caught.
+    existing_dataset_ids = set()
     existing_accessions = set()
+    if 'dataset_id' in existing.columns:
+        existing_dataset_ids = set(existing['dataset_id'].tolist())
     if 'accession' in existing.columns:
         existing_accessions = set(existing['accession'].tolist())
 
@@ -333,9 +341,13 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
     skipped_dup = 0
     for r in new_results:
         acc = str(r.get('accession', '')).strip()
+        did = str(r.get('dataset_id', '')).strip()
 
-        # Skip if already in registry
-        if acc in existing_accessions:
+        # Skip if already in registry (by either identifier)
+        if did and did in existing_dataset_ids:
+            skipped_dup += 1
+            continue
+        if acc and acc in existing_accessions:
             skipped_dup += 1
             continue
 
@@ -354,7 +366,7 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
                 continue
 
         new_rows.append({
-            'dataset_id': r.get('dataset_id', ''),
+            'dataset_id': did,
             'disease': r.get('disease', ''),
             'data_type': r.get('data_type', ''),
             'source': r.get('source', ''),
@@ -372,8 +384,11 @@ def update_registry(new_results, registry_path=REGISTRY_PATH, min_samples=MIN_SA
             'last_verified': datetime.now().strftime('%Y-%m-%d'),
         })
 
-        # Track this accession so we don't add it twice in one run
-        existing_accessions.add(acc)
+        # Track both identifiers so we don't add the same thing twice in one run
+        if did:
+            existing_dataset_ids.add(did)
+        if acc:
+            existing_accessions.add(acc)
 
     if skipped_small > 0:
         log.info(f"  Skipped {skipped_small} datasets with <{min_samples} samples")

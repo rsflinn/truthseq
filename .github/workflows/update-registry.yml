@@ -76,10 +76,12 @@ jobs:
           import pandas as pd
           df = pd.read_csv('dataset_registry.csv')
           before = len(df)
-          # Normalize accession to string and strip whitespace
           df['accession'] = df['accession'].astype(str).str.strip()
-          # Keep first occurrence of each accession (preserves curated entries)
-          df = df.drop_duplicates(subset='accession', keep='first')
+          df['dataset_id'] = df['dataset_id'].astype(str).str.strip()
+          # Dedup on dataset_id (unique per entry). Using accession alone
+          # would incorrectly merge entries that share a deposit (e.g.,
+          # replogle_k562 and replogle_rpe1 both reference Figshare 19968745).
+          df = df.drop_duplicates(subset='dataset_id', keep='first')
           after = len(df)
           df.to_csv('dataset_registry.csv', index=False)
           if before != after:
