@@ -1,0 +1,75 @@
+name: Update Dataset Registry
+
+on:
+  schedule:
+    # Every Monday at 8:00 UTC
+    - cron: '0 8 * * 1'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Search GEO for new autism datasets
+        run: |
+          python3 dataset_search.py \
+            --query "autism spectrum disorder brain RNA-seq" \
+            --update-registry \
+            --max-results 20
+
+      - name: Search GEO for new perturbation datasets
+        run: |
+          python3 dataset_search.py \
+            --query "CRISPR perturbation screen single-cell" \
+            --update-registry \
+            --max-results 10
+
+      - name: Search GEO for new schizophrenia datasets
+        run: |
+          python3 dataset_search.py \
+            --query "schizophrenia brain differential expression" \
+            --update-registry \
+            --max-results 10
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet dataset_registry.csv; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            ADDED=$(git diff dataset_registry.csv | grep "^+" | grep -v "^+++" | wc -l)
+            echo "added=$ADDED" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update dataset registry (automated weekly scan)"
+          title: "Registry update: new datasets found"
+          body: |
+            Automated weekly scan found new datasets via GEO/ArrayExpress search.
+
+            ~${{ steps.changes.outputs.added }} new entries added to `dataset_registry.csv`.
+
+            Please review the new entries for accuracy before merging.
+          branch: automated/registry-update
+          delete-branch: true
+          labels: automated

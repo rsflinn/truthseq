@@ -167,6 +167,9 @@ def process_h5ad(h5ad_path, work_dir):
     effects_path = os.path.join(work_dir, EFFECTS_PARQUET)
     stats_path = os.path.join(work_dir, STATS_PARQUET)
 
+    import numpy as np
+    import pandas as pd
+
     log.info(f"Loading {h5ad_path}...")
     adata = sc.read_h5ad(h5ad_path)
     log.info(f"  Shape: {adata.shape[0]} observations x {adata.shape[1]} genes")
@@ -197,7 +200,6 @@ def process_h5ad(h5ad_path, work_dir):
 
     # ---- Build expression matrix ----
     log.info("Building expression matrix...")
-    import numpy as np
 
     expr_data = adata.X
     if hasattr(expr_data, 'toarray'):
