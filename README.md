@@ -2,7 +2,9 @@
 
 Validate computational gene regulatory claims against real experimental data.
 
-You predicted Gene X regulates Gene Y? TruthSeq checks what actually happened when Gene X was knocked down in human cells. You can also layer on disease tissue expression and genetic association data to build a multi-evidence confidence grade for each claim.
+You predicted Gene X regulates Gene Y? TruthSeq checks what actually happened when Gene X was knocked down in human cells. Works for any disease, any organ, any cell type — upload a CSV of predictions and TruthSeq grades each one against perturbation data, disease tissue expression and genetic associations.
+
+TruthSeq doesn't host every dataset. It ships with a curated registry of publicly available expression datasets, searches GEO and ArrayExpress for more on demand, and walks you through downloading what you need. A weekly automated scan expands the registry as new datasets are published.
 
 ## What it does
 
@@ -38,13 +40,14 @@ python3 truthseq_validate.py \
 TruthSeq includes a dataset registry and search tool to help you find expression data for your disease of interest.
 
 ```bash
-# Search for available datasets
-python3 dataset_search.py --query "autism brain RNA-seq" --verbose
+# Search for available datasets (works for any disease)
+python3 dataset_search.py --query "breast cancer differential expression" --verbose
+python3 dataset_search.py --query "Parkinson disease brain RNA-seq" --verbose
 
 # Or just specify the disease and TruthSeq will check the registry
 python3 truthseq_validate.py \
     --claims claims.csv \
-    --disease "autism" \
+    --disease "breast cancer" \
     --replogle replogle_knockdown_effects.parquet \
     --replogle-stats replogle_knockdown_stats.parquet
 ```
@@ -80,7 +83,7 @@ python3 dataset_search.py --query "schizophrenia single-cell" --update-registry
 python3 dataset_search.py --query "perturbation" --registry-only
 ```
 
-The registry (`dataset_registry.csv`) ships with curated entries for major disease areas and perturbation datasets. You can add your own entries or update it automatically by running searches with `--update-registry`.
+The registry (`dataset_registry.csv`) ships with seed entries across several disease areas and perturbation datasets. You can add your own entries or update it automatically by running searches with `--update-registry`. A GitHub Actions workflow also runs weekly, scanning GEO and ArrayExpress for new datasets in every disease category already in the registry.
 
 ## Claims file format
 

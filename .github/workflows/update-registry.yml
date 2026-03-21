@@ -25,26 +25,42 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      - name: Search GEO for new autism datasets
+      - name: Scan for new datasets based on registry diseases
         run: |
-          python3 dataset_search.py \
-            --query "autism spectrum disorder brain RNA-seq" \
-            --update-registry \
-            --max-results 20
+          python3 -c "
+          import pandas as pd
+          import subprocess, sys
 
-      - name: Search GEO for new perturbation datasets
-        run: |
-          python3 dataset_search.py \
-            --query "CRISPR perturbation screen single-cell" \
-            --update-registry \
-            --max-results 10
+          # Extract unique disease terms from the existing registry
+          df = pd.read_csv('dataset_registry.csv')
+          diseases = set()
+          for d in df['disease'].dropna().unique():
+              for term in d.split(';'):
+                  term = term.strip()
+                  if term and term != 'healthy':
+                      diseases.add(term)
 
-      - name: Search GEO for new schizophrenia datasets
-        run: |
-          python3 dataset_search.py \
-            --query "schizophrenia brain differential expression" \
-            --update-registry \
-            --max-results 10
+          print(f'Found {len(diseases)} disease categories in registry: {diseases}')
+
+          # Search GEO/ArrayExpress for each disease
+          for disease in sorted(diseases):
+              print(f'\n--- Searching for: {disease} ---')
+              subprocess.run([
+                  'python3', 'dataset_search.py',
+                  '--query', f'{disease} differential expression RNA-seq',
+                  '--update-registry',
+                  '--max-results', '10',
+              ])
+
+          # Always search for new perturbation datasets (relevant to all users)
+          print('\n--- Searching for: perturbation datasets ---')
+          subprocess.run([
+              'python3', 'dataset_search.py',
+              '--query', 'CRISPR perturbation screen gene expression',
+              '--update-registry',
+              '--max-results', '10',
+          ])
+          "
 
       - name: Check for changes
         id: changes
@@ -66,6 +82,10 @@ jobs:
           title: "Registry update: new datasets found"
           body: |
             Automated weekly scan found new datasets via GEO/ArrayExpress search.
+
+            The scan checked GEO and ArrayExpress for each disease already in the
+            registry, plus general perturbation datasets. As users add new disease
+            areas to the registry, future scans will automatically cover them.
 
             ~${{ steps.changes.outputs.added }} new entries added to `dataset_registry.csv`.
 
