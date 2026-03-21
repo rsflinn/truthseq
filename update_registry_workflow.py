@@ -17,6 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset_search import search_geo, search_arrayexpress
+from disease_lookup import check_dataset_relevance
 
 REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_registry.csv")
 
@@ -137,8 +138,14 @@ def main():
     new_entries = []
     seen_this_run = set()
 
+    from datetime import datetime
+
     for query in search_queries:
         print(f"\n--- {query} ---")
+
+        # Extract the disease term from the query for relevance checking
+        # Queries look like "bipolar differential expression" or "CRISPR perturbation screen..."
+        query_disease = query.replace('differential expression', '').replace('gene expression', '').strip()
 
         try:
             geo_results = search_geo(query, max_results=10, human_only=True)
@@ -175,14 +182,24 @@ def main():
             if 0 < n < MIN_SAMPLES:
                 continue
 
-            from datetime import datetime
+            # Relevance gate: check if the description matches the search disease
+            description = r.get('description', '')
+            relevance = check_dataset_relevance(description, query_disease)
+            disease_tag = r.get('disease', '')
+
+            if relevance['confidence'] == 'mismatch':
+                # Tag the disease field to flag the mismatch
+                actual_subject = ', '.join(relevance['detected_diseases'])
+                disease_tag = f"FLAGGED:{disease_tag} (description suggests: {actual_subject})"
+                print(f"  FLAGGED: {acc} — tagged as {query_disease} but description suggests {actual_subject}")
+
             entry = {
                 'dataset_id': did,
-                'disease': r.get('disease', ''),
+                'disease': disease_tag,
                 'data_type': r.get('data_type', ''),
                 'source': r.get('source', ''),
                 'accession': acc,
-                'description': r.get('description', ''),
+                'description': description,
                 'n_samples': r.get('n_samples', ''),
                 'species': r.get('species', ''),
                 'tissue': r.get('tissue', ''),
