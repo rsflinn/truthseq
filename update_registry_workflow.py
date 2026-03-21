@@ -2,10 +2,9 @@
 """
 Workflow script for automated registry updates.
 
-Called by GitHub Actions. Reads the existing registry, searches GEO and
-ArrayExpress for each disease term, deduplicates, and writes the result.
-Everything happens in one process with one read and one write to avoid
-intermediate file corruption or quoting inconsistencies.
+Called by GitHub Actions. Searches GEO and ArrayExpress for new datasets,
+checks each against the existing registry, and APPENDS only new entries.
+Never rewrites or reformats existing entries.
 
 Usage:
     python3 update_registry_workflow.py
@@ -13,13 +12,13 @@ Usage:
 
 import sys
 import os
-import csv
-import pandas as pd
 
 # Add script directory to path so we can import dataset_search
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dataset_search import search_geo, search_arrayexpress, REGISTRY_PATH
+from dataset_search import search_geo, search_arrayexpress
+
+REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_registry.csv")
 
 # Terms too vague to produce useful GEO results
 SKIP_TERMS = {'healthy', 'developmental', 'cancer'}
@@ -28,35 +27,105 @@ SKIP_TERMS = {'healthy', 'developmental', 'cancer'}
 MIN_SAMPLES = 10
 
 
+def load_existing_ids(path):
+    """Read the registry and return sets of known dataset_ids and accessions.
+    Uses plain file reading to avoid pandas reformatting anything."""
+    dataset_ids = set()
+    accessions = set()
+
+    if not os.path.exists(path):
+        return dataset_ids, accessions
+
+    with open(path, 'r') as f:
+        header = f.readline().strip().split(',')
+        # Find column positions
+        try:
+            id_col = header.index('dataset_id')
+            acc_col = header.index('accession')
+        except ValueError:
+            print("ERROR: registry CSV missing dataset_id or accession column")
+            return dataset_ids, accessions
+
+        for line in f:
+            # Simple CSV parsing: split by comma, but respect quotes
+            fields = []
+            current = ''
+            in_quotes = False
+            for ch in line.strip():
+                if ch == '"':
+                    in_quotes = not in_quotes
+                elif ch == ',' and not in_quotes:
+                    fields.append(current.strip().strip('"'))
+                    current = ''
+                else:
+                    current += ch
+            fields.append(current.strip().strip('"'))
+
+            if len(fields) > max(id_col, acc_col):
+                did = fields[id_col].strip()
+                acc = fields[acc_col].strip()
+                if did:
+                    dataset_ids.add(did)
+                if acc:
+                    accessions.add(acc)
+
+    return dataset_ids, accessions
+
+
+def format_csv_field(value):
+    """Quote a field if it contains commas, quotes, or newlines."""
+    s = str(value)
+    if ',' in s or '"' in s or '\n' in s:
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def format_row(entry):
+    """Format a dict as a CSV row string matching the registry columns."""
+    cols = [
+        'dataset_id', 'disease', 'data_type', 'source', 'accession',
+        'description', 'n_samples', 'species', 'tissue', 'cell_types',
+        'access_type', 'download_url', 'download_instructions',
+        'paper_doi', 'paper_citation', 'last_verified'
+    ]
+    return ','.join(format_csv_field(entry.get(c, '')) for c in cols)
+
+
 def main():
-    # --- Step 1: Read the existing registry exactly once ---
+    # --- Step 1: Load existing IDs (plain file read, no pandas) ---
     print("=== Reading existing registry ===")
-    existing = pd.read_csv(REGISTRY_PATH)
-    print(f"  Existing entries: {len(existing)}")
-
-    # Normalize identifiers
-    existing['dataset_id'] = existing['dataset_id'].astype(str).str.strip()
-    existing['accession'] = existing['accession'].astype(str).str.strip()
-
-    # Remove any pre-existing duplicates (by dataset_id, which is unique per entry)
-    before = len(existing)
-    existing = existing.drop_duplicates(subset='dataset_id', keep='first')
-    if len(existing) < before:
-        print(f"  Cleaned {before - len(existing)} pre-existing duplicates")
-
-    # Build lookup sets
-    known_dataset_ids = set(existing['dataset_id'].tolist())
-    known_accessions = set(existing['accession'].tolist())
+    known_ids, known_accs = load_existing_ids(REGISTRY_PATH)
+    print(f"  Known dataset_ids: {len(known_ids)}")
+    print(f"  Known accessions: {len(known_accs)}")
 
     # --- Step 2: Extract disease terms from registry ---
     diseases = set()
-    for d in existing['disease'].dropna().unique():
-        for term in d.split(';'):
-            term = term.strip()
-            if term and term not in SKIP_TERMS:
-                diseases.add(term)
+    with open(REGISTRY_PATH, 'r') as f:
+        header = f.readline().strip().split(',')
+        try:
+            disease_col = header.index('disease')
+        except ValueError:
+            disease_col = 1  # fallback
+        for line in f:
+            fields = []
+            current = ''
+            in_quotes = False
+            for ch in line.strip():
+                if ch == '"':
+                    in_quotes = not in_quotes
+                elif ch == ',' and not in_quotes:
+                    fields.append(current.strip().strip('"'))
+                    current = ''
+                else:
+                    current += ch
+            fields.append(current.strip().strip('"'))
 
-    # Always include a general perturbation search
+            if len(fields) > disease_col:
+                for term in fields[disease_col].split(';'):
+                    term = term.strip()
+                    if term and term not in SKIP_TERMS:
+                        diseases.add(term)
+
     search_queries = [f"{d} differential expression" for d in sorted(diseases)]
     search_queries.append("CRISPR perturbation screen gene expression")
 
@@ -64,14 +133,13 @@ def main():
     for q in search_queries:
         print(f"  - {q}")
 
-    # --- Step 3: Run all searches, collect results ---
-    all_new = []
-    seen_in_this_run = set()  # track dataset_ids added during this run
+    # --- Step 3: Search and collect truly new entries ---
+    new_entries = []
+    seen_this_run = set()
 
     for query in search_queries:
         print(f"\n--- {query} ---")
 
-        # Search GEO
         try:
             geo_results = search_geo(query, max_results=10, human_only=True)
             print(f"  GEO: {len(geo_results)} results")
@@ -79,7 +147,6 @@ def main():
             print(f"  GEO error: {e}")
             geo_results = []
 
-        # Search ArrayExpress
         try:
             ae_results = search_arrayexpress(query, max_results=5)
             print(f"  ArrayExpress: {len(ae_results)} results")
@@ -91,14 +158,13 @@ def main():
             did = str(r.get('dataset_id', '')).strip()
             acc = str(r.get('accession', '')).strip()
 
-            # Skip if already in existing registry
-            if did and did in known_dataset_ids:
+            # Skip if already in registry
+            if did and did in known_ids:
                 continue
-            if acc and acc in known_accessions:
+            if acc and acc in known_accs:
                 continue
-
-            # Skip if already added in this run
-            if did and did in seen_in_this_run:
+            # Skip if already found in this run
+            if did and did in seen_this_run:
                 continue
 
             # Skip small datasets
@@ -109,7 +175,8 @@ def main():
             if 0 < n < MIN_SAMPLES:
                 continue
 
-            all_new.append({
+            from datetime import datetime
+            entry = {
                 'dataset_id': did,
                 'disease': r.get('disease', ''),
                 'data_type': r.get('data_type', ''),
@@ -125,36 +192,27 @@ def main():
                 'download_instructions': r.get('download_instructions', ''),
                 'paper_doi': r.get('paper_doi', ''),
                 'paper_citation': r.get('paper_citation', ''),
-                'last_verified': pd.Timestamp.now().strftime('%Y-%m-%d'),
-            })
+                'last_verified': datetime.now().strftime('%Y-%m-%d'),
+            }
+            new_entries.append(entry)
 
             if did:
-                seen_in_this_run.add(did)
+                seen_this_run.add(did)
+                known_ids.add(did)
             if acc:
-                known_accessions.add(acc)
+                known_accs.add(acc)
 
-    # --- Step 4: Merge and write ---
+    # --- Step 4: Append only new entries (never touch existing lines) ---
     print(f"\n=== Results ===")
-    print(f"  New datasets found: {len(all_new)}")
+    print(f"  New datasets found: {len(new_entries)}")
 
-    if all_new:
-        new_df = pd.DataFrame(all_new)
-        combined = pd.concat([existing, new_df], ignore_index=True)
+    if new_entries:
+        with open(REGISTRY_PATH, 'a') as f:
+            for entry in new_entries:
+                f.write(format_row(entry) + '\n')
+        print(f"  Appended {len(new_entries)} new rows to registry")
     else:
-        combined = existing
-
-    # Final safety dedup on dataset_id
-    before_final = len(combined)
-    combined['dataset_id'] = combined['dataset_id'].astype(str).str.strip()
-    combined = combined.drop_duplicates(subset='dataset_id', keep='first')
-    if len(combined) < before_final:
-        print(f"  Final dedup removed {before_final - len(combined)} entries")
-
-    print(f"  Total entries: {len(combined)}")
-
-    # Write with consistent quoting (quote fields containing commas)
-    combined.to_csv(REGISTRY_PATH, index=False, quoting=csv.QUOTE_NONNUMERIC)
-    print(f"  Written to {REGISTRY_PATH}")
+        print("  No new datasets to add")
 
     return 0
 
