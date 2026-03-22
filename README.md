@@ -45,6 +45,8 @@ TruthSeq tests whether one gene controls another gene's expression. That's a spe
 
 It can't test broader biological questions like "does this mutation cause drug resistance?" or "does this pathway drive inflammation?" Those involve protein function, cell behavior and other mechanisms beyond gene expression. But if the upstream step in your model is "Gene X controls Gene Y," TruthSeq can tell you whether that step holds up.
 
+**One gene at a time.** The knockdown data tests what happens when a single gene is disabled. Biology doesn't work that way — multiple regulators act simultaneously, often at partial levels rather than full on/off. TruthSeq cannot test whether two or more genes acting together produce effects that differ from the sum of their individual contributions. If your model depends on combinatorial or synergistic effects between genes, TruthSeq can validate each individual edge but not the interaction between them.
+
 ## What you need
 
 - Python 3.8 or later (type `python3 --version` in your terminal to check)
@@ -143,9 +145,68 @@ python3 truthseq_validate.py \
 
 See `format_spec.md` for the expected file format. TruthSeq is flexible with column names — `log2fc`, `logFC`, `log2FoldChange` all work.
 
+## Specificity test: Is your gene set actually special?
+
+This is arguably the most important feature in TruthSeq. Individual gene-to-gene relationships can be real and validated, but that doesn't mean the specific genes you chose are special. Many genes regulate the same downstream targets, and a validated result might simply reflect a generic property of the genome rather than something unique to your pathway.
+
+The `--specificity` flag tests this directly. It keeps your downstream target genes fixed and replaces your upstream regulators with random genes from the knockdown dataset. If random genes produce similar results, your gene set isn't special — even though the individual edges are real.
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --replogle replogle_knockdown_effects.parquet \
+    --replogle-stats replogle_knockdown_stats.parquet \
+    --specificity \
+    --output results
+```
+
+The output tells you:
+
+- How many of your claims scored "supported" vs. how many random gene sets scored equally well
+- Whether your upstream genes produce stronger effects on the targets than random knockdowns
+- Whether the direction predictions beat chance
+
+### Making the comparison fair
+
+The comparison pool determines how hard the test is. By default, TruthSeq compares your genes against all ~7,600 genes in the knockdown dataset. Most disease-related gene sets will pass this test easily — it's a low bar.
+
+To make the comparison meaningful, you need to test against genes that are similar to yours. TruthSeq supports two ways to do this:
+
+**Automatic (from disease data):** If you provide Tier 2 disease expression data, TruthSeq automatically restricts the comparison pool to genes that are dysregulated in that disease. This tests whether your genes are special among other disease-associated genes — a much harder bar to clear.
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --disease-expr my_disease_data.tsv \
+    --specificity \
+    --output results
+```
+
+**Custom pool:** Supply a text file of gene symbols to compare against. This is the most rigorous option when you know what genes are functionally comparable to yours — for example, other transcription factors associated with the same disease category.
+
+```bash
+python3 truthseq_validate.py \
+    --claims claims.csv \
+    --specificity \
+    --specificity-pool my_comparison_genes.txt \
+    --output results
+```
+
+The pool file is one gene symbol per line (lines starting with # are ignored).
+
+### What specificity doesn't test
+
+The specificity test checks whether your individual regulatory edges are stronger than what random genes would produce. It does not test whether your gene set as a whole has special network-level properties — for example, whether your genes converge on the same targets more than comparable gene sets do. That's a different question (and a harder one). Passing the specificity test means your individual claims are real and non-trivial. It doesn't mean the network connecting them has special properties beyond what the individual edges contribute.
+
+You can adjust the number of permutations with `--specificity-perms` (default: 1000).
+
 ## Important caveats
 
 The Tier 1 lab dataset uses K562 cells, a blood-derived cell line chosen because it's the only cell type where genome-scale knockdown experiments have been done. No equivalent dataset exists for brain cells, immune cells or any other tissue — this is the only one of its kind on the planet. Gene regulation varies by cell type, so a relationship that's real in brain cells might not show up in K562. A WEAK grade means "not detectable in this system," not "this is wrong." Tier 2 disease tissue data helps compensate by checking whether the genes are actually disrupted in the tissue relevant to your work.
+
+TruthSeq measures mRNA levels, not protein. A gene could show no mRNA change after a knockdown but have significant protein-level disruption (through translation, degradation or modification), or vice versa. For most computational gene regulatory predictions this is fine, because those models also predict mRNA changes. But if your model involves post-translational mechanisms, TruthSeq won't capture them.
+
+The knockdown data is measured at a single time point after perturbation, not tracked over time. A regulatory relationship that's transient — Gene X briefly activates Gene Y, then Gene Y returns to baseline — could score WEAK or miss entirely. Sustained effects are captured; transient dynamics are not.
 
 TruthSeq can't prove that Gene X controls Gene Y in a living organism. It can tell you whether disabling Gene X changed Gene Y's expression in a controlled lab setting, and whether Gene Y is disrupted in real disease tissue. The point is to catch findings that are clearly unsupported before you invest months following them.
 

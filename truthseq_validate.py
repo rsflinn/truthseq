@@ -760,7 +760,245 @@ def compute_base_rate(results_df, replogle_df):
     }
 
 
-def generate_summary_report(results_df, base_rate, disease_source, output_dir):
+def compute_specificity(results_df, replogle_df, stats_df=None, n_permutations=1000,
+                        comparison_pool=None, disease_df=None, pool_source="all knockdowns"):
+    """
+    Specificity test: Are your upstream regulators special for these downstream targets,
+    or would random knockdown genes affect the same targets equally well?
+
+    For each permutation:
+      - Keep every downstream target gene fixed
+      - Replace each upstream gene with a random gene from the comparison pool
+      - Score the random set the same way as the real claims
+      - Count how many random sets score as well or better than yours
+
+    The comparison pool determines how hard the test is:
+      - All knockdown genes (default): low bar. Most disease gene sets will pass.
+      - Disease-associated genes (auto from Tier 2): medium bar. Tests whether your
+        genes are special among genes disrupted in the same disease.
+      - Custom gene list (--specificity-pool): user-defined. Toughest test when the
+        user supplies functionally similar genes (e.g., other NDD TFs).
+
+    This is the test that distinguishes "real regulatory relationship" from
+    "real but generic — any TF would do."
+    """
+    if replogle_df is None:
+        return None
+
+    log.info("Running specificity comparison...")
+    np.random.seed(RANDOM_SEED + 2)
+
+    # Determine the comparison pool
+    all_kd_genes_set = set(replogle_df['knocked_down_gene'].unique())
+
+    if comparison_pool is not None:
+        # User-supplied gene list — filter to those in the knockdown dataset
+        pool_genes = list(all_kd_genes_set & set(comparison_pool))
+        if len(pool_genes) < 10:
+            log.warning(f"  Only {len(pool_genes)} of {len(comparison_pool)} pool genes "
+                        f"are in the knockdown dataset. Need at least 10. Falling back to all genes.")
+            pool_genes = list(all_kd_genes_set)
+            pool_source = "all knockdowns (custom pool too small)"
+        else:
+            log.info(f"  Custom pool: {len(pool_genes)} genes "
+                     f"({len(comparison_pool)} supplied, {len(pool_genes)} in knockdown dataset)")
+    elif disease_df is not None and 'gene' in disease_df.columns:
+        # Auto-generate pool from Tier 2 disease data: genes significantly dysregulated
+        sig_disease = disease_df[disease_df['padj'] <= 0.05]
+        disease_genes = set(sig_disease['gene'].unique())
+        pool_genes = list(all_kd_genes_set & disease_genes)
+        if len(pool_genes) < 20:
+            log.warning(f"  Only {len(pool_genes)} disease-associated genes are in the "
+                        f"knockdown dataset. Falling back to all genes.")
+            pool_genes = list(all_kd_genes_set)
+            pool_source = "all knockdowns (too few disease genes in knockdown data)"
+        else:
+            pool_source = f"disease-associated genes ({len(pool_genes)} genes dysregulated in disease AND in knockdown dataset)"
+            log.info(f"  Disease-filtered pool: {len(pool_genes)} genes "
+                     f"({len(disease_genes)} dysregulated in disease, "
+                     f"{len(pool_genes)} also in knockdown dataset)")
+    else:
+        pool_genes = list(all_kd_genes_set)
+        pool_source = f"all knockdowns ({len(pool_genes)} genes)"
+
+    all_kd_genes = pool_genes
+    log.info(f"  Comparison pool: {pool_source}")
+
+    # Build lookup structures — sample to fit in memory
+    log.info("  Building lookup index for specificity test...")
+    max_pairs = 2_000_000
+    if len(replogle_df) > max_pairs:
+        log.info(f"  Dataset has {len(replogle_df):,} pairs — sampling {max_pairs:,} for specificity")
+        sim_df = replogle_df.sample(n=max_pairs, random_state=RANDOM_SEED)
+    else:
+        sim_df = replogle_df
+
+    # Also ensure user's actual claim pairs are in the index
+    user_upstreams_set = set(replogle_df['knocked_down_gene'].unique())  # Need all KD genes
+    downstream_targets = set()  # Will be populated from claims below
+
+    # Index: (upstream, downstream) -> z_score
+    pair_z = dict(zip(
+        zip(sim_df['knocked_down_gene'], sim_df['affected_gene']),
+        sim_df['z_score']
+    ))
+
+    # Per-knockdown |Z| distributions for percentile calculation (from sampled data)
+    kd_abs_z = {}
+    for kd_gene, group in sim_df.groupby('knocked_down_gene'):
+        kd_abs_z[kd_gene] = np.sort(group['z_score'].abs().values)
+
+    # Also track which knockdowns are in the stats file (for below-threshold awareness)
+    stats_kd_genes = set()
+    if stats_df is not None:
+        stats_kd_genes = set(stats_df['knocked_down_gene'].unique())
+
+    all_kd_set = set(all_kd_genes) | stats_kd_genes
+
+    # Score the user's actual claims
+    def score_claim_set(upstream_genes, downstream_genes, predicted_dirs):
+        """
+        Score a set of claims. Returns:
+          - n_supported: count of claims that would grade VALIDATED or PARTIALLY_SUPPORTED
+          - mean_percentile: average percentile across testable claims
+          - n_direction_match: count of direction matches
+        """
+        n_supported = 0
+        percentiles = []
+        n_dir_match = 0
+        n_testable = 0
+
+        for up, down, pred_dir in zip(upstream_genes, downstream_genes, predicted_dirs):
+            if up not in all_kd_set:
+                continue  # Can't test this one
+
+            n_testable += 1
+            z = pair_z.get((up, down))
+
+            if z is not None:
+                abs_z = abs(z)
+                # Direction check: z < 0 means KO reduced target → gene activates (UP)
+                observed_dir = "UP" if z < 0 else "DOWN"
+                dir_match = (observed_dir == pred_dir)
+                if dir_match:
+                    n_dir_match += 1
+
+                # Percentile
+                if up in kd_abs_z:
+                    pct = float(sp_stats.percentileofscore(kd_abs_z[up], abs_z))
+                else:
+                    pct = 50.0
+                percentiles.append(pct)
+
+                # Would this grade as supported?
+                if dir_match and pct >= PERCENTILE_PARTIAL:
+                    n_supported += 1
+            else:
+                # Below threshold — weak
+                percentiles.append(25.0)  # Estimate for sub-threshold
+
+        mean_pct = np.mean(percentiles) if percentiles else 0
+        return {
+            'n_supported': n_supported,
+            'mean_percentile': mean_pct,
+            'n_direction_match': n_dir_match,
+            'n_testable': n_testable
+        }
+
+    # Add user's actual claim pairs to the index if missing from sample
+    user_up_set = set(results_df['upstream_gene'])
+    user_down_set = set(results_df['downstream_gene'])
+    for up in user_up_set:
+        for down in user_down_set:
+            if (up, down) not in pair_z:
+                mask = (replogle_df['knocked_down_gene'] == up) & (replogle_df['affected_gene'] == down)
+                hits = replogle_df.loc[mask]
+                if len(hits) > 0:
+                    pair_z[(up, down)] = float(hits.iloc[0]['z_score'])
+    # Ensure user's knockdowns have percentile distributions
+    for up in user_up_set:
+        if up not in kd_abs_z:
+            kd_data = replogle_df[replogle_df['knocked_down_gene'] == up]
+            if len(kd_data) > 0:
+                kd_abs_z[up] = np.sort(kd_data['z_score'].abs().values[:5000])
+
+    log.info(f"  Index built: {len(pair_z):,} pairs, {len(kd_abs_z)} knockdown distributions")
+
+    # Score the user's actual claims
+    user_upstreams = results_df['upstream_gene'].tolist()
+    user_downstreams = results_df['downstream_gene'].tolist()
+    user_directions = results_df['predicted_direction'].tolist()
+
+    user_score = score_claim_set(user_upstreams, user_downstreams, user_directions)
+    log.info(f"  User claims: {user_score['n_supported']}/{user_score['n_testable']} supported, "
+             f"mean percentile {user_score['mean_percentile']:.1f}")
+
+    # Run permutations: replace upstream genes with random knockdown genes
+    # Keep downstream targets and predicted directions fixed
+    null_supported = []
+    null_percentiles = []
+    null_dir_matches = []
+
+    n_unique_upstreams = len(set(user_upstreams))
+
+    for perm_i in range(n_permutations):
+        if perm_i % 200 == 0:
+            log.info(f"  Permutation {perm_i}/{n_permutations}...")
+
+        # Strategy: pick n_unique random upstream genes, then map them to claims
+        # This preserves the structure where one upstream gene may appear in multiple claims
+        random_pool = np.random.choice(all_kd_genes, n_unique_upstreams, replace=False)
+        upstream_map = dict(zip(sorted(set(user_upstreams)), random_pool))
+
+        random_upstreams = [upstream_map.get(u, np.random.choice(all_kd_genes))
+                           for u in user_upstreams]
+
+        perm_score = score_claim_set(random_upstreams, user_downstreams, user_directions)
+        null_supported.append(perm_score['n_supported'])
+        null_percentiles.append(perm_score['mean_percentile'])
+        null_dir_matches.append(perm_score['n_direction_match'])
+
+    null_supported = np.array(null_supported)
+    null_percentiles = np.array(null_percentiles)
+    null_dir_matches = np.array(null_dir_matches)
+
+    # Calculate where user's set ranks
+    supported_rank = float(np.mean(null_supported >= user_score['n_supported']))
+    percentile_rank = float(np.mean(null_percentiles >= user_score['mean_percentile']))
+    direction_rank = float(np.mean(null_dir_matches >= user_score['n_direction_match']))
+
+    result = {
+        'user_n_supported': user_score['n_supported'],
+        'user_mean_percentile': round(user_score['mean_percentile'], 1),
+        'user_n_direction_match': user_score['n_direction_match'],
+        'user_n_testable': user_score['n_testable'],
+        'null_supported_mean': round(float(np.mean(null_supported)), 2),
+        'null_supported_std': round(float(np.std(null_supported)), 2),
+        'null_percentile_mean': round(float(np.mean(null_percentiles)), 1),
+        'null_percentile_std': round(float(np.std(null_percentiles)), 1),
+        'null_direction_mean': round(float(np.mean(null_dir_matches)), 2),
+        'p_supported': round(supported_rank, 4),
+        'p_percentile': round(percentile_rank, 4),
+        'p_direction': round(direction_rank, 4),
+        'n_permutations': n_permutations,
+        'gene_pool_size': len(all_kd_genes),
+        'pool_source': pool_source,
+    }
+
+    log.info(f"  Specificity results:")
+    log.info(f"    Supported claims: {user_score['n_supported']} "
+             f"(null: {result['null_supported_mean']} +/- {result['null_supported_std']}, "
+             f"p={result['p_supported']})")
+    log.info(f"    Mean percentile:  {user_score['mean_percentile']:.1f} "
+             f"(null: {result['null_percentile_mean']} +/- {result['null_percentile_std']}, "
+             f"p={result['p_percentile']})")
+    log.info(f"    Direction match:  {user_score['n_direction_match']}/{user_score['n_testable']} "
+             f"(null: {result['null_direction_mean']}, p={result['p_direction']})")
+
+    return result
+
+
+def generate_summary_report(results_df, base_rate, disease_source, output_dir, specificity=None):
     grade_counts = results_df['confidence_grade'].value_counts()
     n = len(results_df)
 
@@ -807,6 +1045,98 @@ def generate_summary_report(results_df, base_rate, disease_source, output_dir):
             lines.append(f"")
             lines.append(f"Null distribution had zero variance — likely too few perturbation matches.")
 
+        lines.append("")
+
+    if specificity:
+        lines.append("## Specificity Test")
+        lines.append("")
+        lines.append(
+            "This test asks: are your chosen upstream regulators special for these "
+            "downstream targets, or would random genes from the knockdown dataset "
+            "produce similar results? For each permutation, the downstream targets "
+            "stay fixed while the upstream genes are replaced with random knockdowns."
+        )
+        lines.append("")
+
+        user_sup = specificity['user_n_supported']
+        null_sup_mean = specificity['null_supported_mean']
+        null_sup_std = specificity['null_supported_std']
+        p_sup = specificity['p_supported']
+        user_pct = specificity['user_mean_percentile']
+        null_pct_mean = specificity['null_percentile_mean']
+        p_pct = specificity['p_percentile']
+        user_dir = specificity['user_n_direction_match']
+        n_testable = specificity['user_n_testable']
+        null_dir = specificity['null_direction_mean']
+        p_dir = specificity['p_direction']
+        n_perms = specificity['n_permutations']
+        pool = specificity['gene_pool_size']
+
+        spec_pool_source = specificity.get('pool_source', f'{pool:,} knockdown genes')
+        lines.append(
+            f"Comparison pool: {spec_pool_source}. "
+            f"Pool size: {pool:,} genes. Permutations: {n_perms:,}."
+        )
+        lines.append("")
+        lines.append(f"| Metric | Your genes | Random genes (mean +/- SD) | p-value | Interpretation |")
+        lines.append(f"|--------|-----------|---------------------------|---------|----------------|")
+
+        # Supported claims
+        if p_sup < 0.05:
+            sup_interp = "Your regulators produce MORE supported claims than random"
+        elif p_sup > 0.5:
+            sup_interp = "Random genes score as well or better — your set is NOT special"
+        else:
+            sup_interp = "No significant difference from random gene sets"
+        lines.append(
+            f"| Supported claims | {user_sup}/{n_testable} | "
+            f"{null_sup_mean} +/- {null_sup_std} | {p_sup} | {sup_interp} |"
+        )
+
+        # Mean percentile
+        if p_pct < 0.05:
+            pct_interp = "Stronger effects than random regulators"
+        elif p_pct > 0.5:
+            pct_interp = "Effect sizes are typical, not exceptional"
+        else:
+            pct_interp = "No significant difference"
+        lines.append(
+            f"| Mean effect percentile | {user_pct} | "
+            f"{null_pct_mean} +/- {specificity['null_percentile_std']} | {p_pct} | {pct_interp} |"
+        )
+
+        # Direction match
+        if p_dir < 0.05:
+            dir_interp = "Direction predictions are better than chance"
+        else:
+            dir_interp = "Direction match rate is typical"
+        lines.append(
+            f"| Direction matches | {user_dir}/{n_testable} | "
+            f"{null_dir} | {p_dir} | {dir_interp} |"
+        )
+
+        lines.append("")
+
+        # Bottom-line interpretation
+        if p_sup < 0.05 and p_pct < 0.05:
+            lines.append(
+                "**Bottom line**: Your gene set shows SPECIFIC regulatory effects on these "
+                "targets that exceed what random genes produce. The regulatory relationships "
+                "are not just real — they are stronger than the genomic background."
+            )
+        elif p_sup >= 0.05 and p_pct >= 0.05:
+            lines.append(
+                "**Bottom line**: Random knockdown genes affect these same targets at similar "
+                "rates and magnitudes. Your regulatory claims may be REAL (the individual edges "
+                "exist) but they are NOT SPECIFIC — many genes would produce the same results. "
+                "This is a common pattern: genes that regulate fundamental cellular processes "
+                "often show 'validated' relationships that are not unique to the claimed pathway."
+            )
+        else:
+            lines.append(
+                "**Bottom line**: Mixed specificity. Some metrics suggest your gene set is "
+                "special; others do not. Interpret individual claim grades with caution."
+            )
         lines.append("")
 
     lines.append("## Per-Claim Evidence")
@@ -991,6 +1321,16 @@ def main():
     parser.add_argument('--output', default='truthseq_report', help='Output directory')
     parser.add_argument('--skip-ot', action='store_true', help='Skip Open Targets API')
     parser.add_argument('--skip-base-rate', action='store_true', help='Skip base rate simulation')
+    parser.add_argument('--specificity', action='store_true',
+                        help='Run specificity test: are your upstream genes special for these '
+                             'targets, or would random knockdown genes score equally well?')
+    parser.add_argument('--specificity-perms', type=int, default=1000,
+                        help='Number of permutations for specificity test (default: 1000)')
+    parser.add_argument('--specificity-pool', default=None,
+                        help='Text file with one gene symbol per line to use as the comparison '
+                             'pool. Without this, TruthSeq auto-generates a pool from disease '
+                             'expression data (Tier 2) if available, or falls back to all '
+                             'knockdown genes.')
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -1069,10 +1409,39 @@ def main():
             log.info(f"  Null: {base_rate['null_mean']} +/- {base_rate['null_std']}")
             log.info(f"  Observed: {base_rate['observed']}")
 
+    # Specificity test
+    specificity = None
+    if args.specificity and replogle_df is not None:
+        log.info("")
+        log.info("=== Specificity Test ===")
+
+        # Load custom comparison pool if supplied
+        custom_pool = None
+        pool_source = "all knockdowns"
+        if args.specificity_pool and os.path.exists(args.specificity_pool):
+            with open(args.specificity_pool) as f:
+                custom_pool = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            pool_source = f"custom pool from {args.specificity_pool}"
+            log.info(f"Loaded custom comparison pool: {len(custom_pool)} genes from {args.specificity_pool}")
+
+        specificity = compute_specificity(
+            results_df, replogle_df, stats_df,
+            n_permutations=args.specificity_perms,
+            comparison_pool=custom_pool,
+            disease_df=disease_df,
+            pool_source=pool_source,
+        )
+        # Save specificity results as JSON
+        spec_path = os.path.join(args.output, "truthseq_specificity.json")
+        with open(spec_path, 'w') as f:
+            json.dump(specificity, f, indent=2)
+        log.info(f"Specificity results saved to {spec_path}")
+
     # Reports
     log.info("")
     log.info("=== Generating Reports ===")
-    generate_summary_report(results_df, base_rate, disease_source, args.output)
+    generate_summary_report(results_df, base_rate, disease_source, args.output,
+                            specificity=specificity)
     generate_heatmap(results_df, args.output)
 
     # Console summary
@@ -1088,11 +1457,37 @@ def main():
         c = grade_counts.get(g, 0)
         print(f"  {g:25s} {c}")
     print(f"  {'TOTAL':25s} {len(results_df)}")
+
+    if specificity:
+        print("")
+        print("-" * 60)
+        print("Specificity Test")
+        print("-" * 60)
+        print(f"  Pool: {specificity.get('pool_source', 'all knockdowns')} "
+              f"({specificity['gene_pool_size']} genes)")
+        p_sup = specificity['p_supported']
+        p_pct = specificity['p_percentile']
+        print(f"  Your genes:   {specificity['user_n_supported']}/{specificity['user_n_testable']} supported, "
+              f"mean {specificity['user_mean_percentile']}th percentile")
+        print(f"  Random genes: {specificity['null_supported_mean']} +/- {specificity['null_supported_std']} supported, "
+              f"mean {specificity['null_percentile_mean']}th percentile")
+        print(f"  p-value (supported): {p_sup}")
+        print(f"  p-value (effect size): {p_pct}")
+        if p_sup >= 0.05 and p_pct >= 0.05:
+            print(f"  >> Your gene set is NOT more special than random knockdown genes")
+            print(f"     for these downstream targets. Claims may be real but not specific.")
+        elif p_sup < 0.05 and p_pct < 0.05:
+            print(f"  >> Your gene set shows SPECIFIC effects beyond random background.")
+        else:
+            print(f"  >> Mixed results — some metrics specific, others not.")
+
     print("")
     print(f"Output: {args.output}/")
     print(f"  truthseq_results.csv    — full evidence table")
     print(f"  truthseq_summary.md     — human-readable report")
     print(f"  truthseq_heatmap.png    — confidence visualization")
+    if specificity:
+        print(f"  truthseq_specificity.json — specificity test results")
     print("")
 
     return 0
