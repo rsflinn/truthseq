@@ -531,7 +531,7 @@ TYPEWRITER_JS = """
 
 # Pre-built parquet files hosted on GitHub Releases (no scanpy needed)
 GITHUB_RELEASE_BASE = "https://github.com/rsflinn/truthseq/releases/download/v1.0.0"
-EFFECTS_URL = f"{GITHUB_RELEASE_BASE}/replogle_knockdown_effects.parquet"
+EFFECTS_URL = f"{GITHUB_RELEASE_BASE}/replogle_knockdown_effects_cloud.parquet"
 STATS_URL = f"{GITHUB_RELEASE_BASE}/replogle_knockdown_stats.parquet"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
@@ -646,6 +646,23 @@ def find_data_files():
 # Validation Logic
 # ============================================================
 
+def compute_percentile_from_stats(z_score, upstream, stats_df):
+    """Compute approximate percentile using pre-computed quantiles from stats_df."""
+    abs_z = abs(z_score)
+    kd_stats = stats_df[stats_df['knocked_down_gene'] == upstream]
+    if len(kd_stats) == 0:
+        return 50.0
+
+    row = kd_stats.iloc[0]
+    # Walk through quantile breakpoints to estimate percentile
+    quantiles = [5, 10, 25, 50, 75, 80, 85, 90, 95, 97, 99]
+    for q in quantiles:
+        col = f'q{q:02d}'
+        if col in row and abs_z <= row[col]:
+            return float(q)
+    return 99.5  # above q99
+
+
 def compute_percentile_from_distribution(z_score, kd_data):
     """Compute percentile rank of a Z-score within a knockdown's distribution."""
     abs_z = abs(z_score)
@@ -682,11 +699,15 @@ def validate_single_claim(upstream, downstream, predicted_dir, effects_df, stats
             obs_dir = "UP" if z < 0 else "DOWN"
             dir_match = (obs_dir == predicted_dir)
 
-            ct_kd = kd_data
-            if 'cell_line' in kd_data.columns:
-                ct_kd = kd_data[kd_data['cell_line'] == ct]
-
-            pct = compute_percentile_from_distribution(z, ct_kd) if len(ct_kd) > 0 else 50.0
+            # Use stats-based percentile (fast, works with trimmed cloud dataset)
+            # Fall back to distribution-based if stats not available
+            if stats_df is not None:
+                pct = compute_percentile_from_stats(z, upstream, stats_df)
+            else:
+                ct_kd = kd_data
+                if 'cell_line' in kd_data.columns:
+                    ct_kd = kd_data[kd_data['cell_line'] == ct]
+                pct = compute_percentile_from_distribution(z, ct_kd) if len(ct_kd) > 0 else 50.0
 
             per_ct.append({
                 'cell_line': ct,
